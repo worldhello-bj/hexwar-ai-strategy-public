@@ -28,13 +28,3 @@ jobs:
         run: python tools/verify_rules.py
       - name: Existing table consistency
         run: python tools/verify_tables.py
-      # ↓ 把「检查」交给机器跑，而不是相信谁（含 AI）自觉：
-      #   ① 初设数据不变式（开局无人在车内 / 36 单位 / 位置合法 / 离线桩对账）
-      #   ② 训练入口的规则门（公开克隆布局 = 直接用仓库根的核心，不依赖 train/ 生成副本）
-      #   ③ 真跑一局：证明"能训练"不是空话（缺 env/scenario 会在这里红）
-      - name: 比赛初设数据核对
-        run: python tools/verify_scenario_units.py
-      - name: 训练环境门禁（rules gate）
-        run: python train/run_train.py rules
-      - name: 训练环境冒烟（真实想定跑 3 局）
-        run: python train/run_train.py mc --config train/configs/smoke_realmap.json

@@ -12,12 +12,6 @@
 
     py -3.13 run_train.py train --algo ppo --config configs/ppo_realmap.json
 
-★ 边界（别把它当正确性证明）：规则门只证明"**已被线上实测证过的点没有被改动破坏**"，
-  缺脚本/跑不动一律**硬失败**（绝不"跳过"后报成功）。没有实测样本覆盖的地方
-  （表4 攻级 1–6/8、间瞄、反应装甲、终局结算）它不过问 —— 那得靠继续采样对账。
-  CI 里同时跑 `run_train.py rules` 与 `run_train.py mc`：把"能训练"交给机器证，
-  而不是靠维护者（或 AI）声明。
-
 子命令
 ------
   rules       规则符合性门：selftest + verify_tables/rules/extra/unfavorable + 计分对账
@@ -31,11 +25,8 @@
   diff        枚举等价性差分（快口径 vs 深度校验）
   check       train/ 与核心仓库的漂移检查（MANIFEST.json）
 
-★ 两种布局都能跑（本入口自己判别）：
-  A. **自包含副本** —— `tools/build_train_env.py` 生成，`train/` 里有 engine/env/tools/scenario；
-  B. **直接用仓库根的核心** —— 公开克隆就是这种（`train/` 里只有本文件与 configs）。
-  判别方式：`train/engine` 与 `train/tools/verify_rules.py` 在不在。
-  找不到核心时**直接报错**，不会把规则门变成空转。
+★ 两种布局都能跑（本入口自己判别）：`train/engine` 在就用副本，否则用仓库根的
+  核心（公开克隆就是这种）；都找不到直接报错，不让规则门空转。
 
 约定
 ----
@@ -127,29 +118,6 @@ ALLOWED = {
 }
 MODULE = {"mc": "env.selfplay", "ppo": "env.neural_train", "eval": "env.policy_eval",
           "run_episode": "env.run_episode", "diff": "tools.hex_env_diff"}
-
-MC_ALGO = "first_visit_terminal_mc"
-NEURAL_ALGOS = ("neural_terminal_reinforce_vs_random", "neural_terminal_ppo_clip_vs_random")
-
-
-def checkpoint_kind(path):
-    """检查点类型 → 用哪个评测器：'mc'（表）/ 'neural'（策略）/ None（不认识）。
-
-    两个加载器互不兼容（`env.policy_eval` → SelfPlayTrainer 只认 MC 表；
-    `env.neural_train` → NeuralTrainer 只认神经策略）。文档里的 "train → eval" 流程
-    在 PPO 检查点上曾直接报 `unsupported checkpoint`，所以这里先判类型再分流，
-    判不出来就报错，不隷。
-    """
-    try:
-        with open(path, encoding="utf-8") as fh:
-            algo = json.load(fh).get("algorithm")
-    except (OSError, ValueError):
-        return None
-    if algo == MC_ALGO:
-        return "mc"
-    if algo in NEURAL_ALGOS:
-        return "neural"
-    return None
 
 
 def core_root():
@@ -315,30 +283,7 @@ def main():
     if sub in ("mc", "ppo") and not (cfg.get("checkpoint") or "--checkpoint" in extra):
         raise SystemExit("%s 需要 checkpoint（或在配置里给 checkpoint）" % sub)
     argv = to_argv(cfg) + extra
-    if sub == "eval":
-        ck = cfg.get("checkpoint")
-        if ck is None and "--checkpoint" in extra:
-            ck = extra[extra.index("--checkpoint") + 1]
-        kind = checkpoint_kind(os.path.join(HERE, str(ck))) if ck else None
-        if kind is None:
-            raise SystemExit(
-                "eval 需要 --checkpoint，且只认两类：MC 表（algorithm=%s）或神经策略\n"
-                "（%s）。读不到或不认识的检查点不猜——先看该文件里的 algorithm 字段。"
-                % (MC_ALGO, " / ".join(NEURAL_ALGOS)))
-        if kind == "neural":
-            # 神经策略没有独立评测器：走 neural_train 的 --eval-only（同一 evaluate()）
-            argv = ["--eval-only", "--checkpoint", str(ck),
-                    "--snapshot", str(cfg.get("snapshot", DEFAULT_SCENARIO)),
-                    "--report", str(cfg.get("report", "analysis/eval.json"))]
-            if cfg.get("allow_real_map"):
-                argv.insert(1, "--allow-real-map")
-            if cfg.get("seeds"):
-                argv += ["--eval-seeds"] + [str(s) for s in cfg["seeds"]]
-            cmd = [PY, "-m", "env.neural_train"] + argv
-        else:
-            cmd = py_module(MODULE["eval"], argv)
-    else:
-        cmd = py_module(MODULE[sub], argv)
+    cmd = py_module(MODULE[sub], argv)
     ensure_dirs(cfg)
     if args.dry_run:
         print("$ " + " ".join(cmd))
