@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from env.neural_train import NeuralTrainer, canonical, summary
 from env.neural_policy import NeuralPolicy
+from env.compact_checkpoint import state_digest
 from engine import scoring
 from tools.evaluate_neural_checkpoint import paired_deltas
 from tools.export_policy_replay import export_replay
@@ -41,6 +42,30 @@ def atomic_json(path, data):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
+
+
+def atomic_npz(path, trainer):
+    """Replace only this locked run's checkpoint after a durable, complete save."""
+    path = Path(path)
+    temporary = path.with_name('.' + path.stem + '-' + uuid.uuid4().hex + '.tmp.npz')
+    owned = True
+    try:
+        try:
+            trainer.save(temporary)  # Exclusive creation, array transport; never checkpoint() lists.
+        except FileExistsError:
+            owned = False  # Never remove a pre-existing colliding temporary path.
+            raise
+        with temporary.open('rb') as stream:
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        descriptor = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    finally:
+        if owned:
+            temporary.unlink(missing_ok=True)
 
 
 def source_manifest(root=ROOT):
@@ -88,13 +113,18 @@ def parser():
     p.add_argument('--initialize-from', type=Path, help='import a completed batch into a new run; never combines with resume')
     p.add_argument('--parent-training-report', type=Path, help='complete historical training journal matching the imported checkpoint')
     p.add_argument('--episodes', type=int, default=160, help='total attempt budget, including resumed attempts')
+    p.add_argument('--checkpoint-format', choices=['json', 'npz'], default='json',
+                   help='checkpoint transport for this run; resume requires the same format')
     p.add_argument('--checkpoint-every', type=int, default=8)
     p.add_argument('--seed', type=int, default=7527)
     p.add_argument('--train-seed-start', type=int, default=0)
     p.add_argument('--eval-seeds', type=int, nargs='+', default=[1000000, 1000001, 1000002, 1000003])
     p.add_argument('--batch-episodes', type=int, default=8)
+    p.add_argument('--baseline-offset', choices=['none', 'prior_batch_mean', 'public_own_score'],
+                   default='prior_batch_mean')
+    p.add_argument('--training-diagnostics', action='store_true')
     p.add_argument('--update-mode', choices=['reinforce', 'ppo_clip'], default='ppo_clip')
-    p.add_argument('--observation-schema', type=int, choices=[2, 3], default=2)
+    p.add_argument('--observation-schema', type=int, choices=[2, 3, 4], default=2)
     p.add_argument('--projection-backend', choices=['numpy', 'scipy_csr'], default='numpy')
     p.add_argument('--scoring-mode', choices=['verified', 'platform'], default='verified')
     return p
@@ -136,7 +166,7 @@ def requested_config(args):
               'observation_schema': args.observation_schema, 'allow_real': True, 'scoring_mode': args.scoring_mode,
               'episode_config': {'max_seconds': 1800, 'max_steps': 1000, 'move_radius': 3},
               'policy_config': {'buckets': 4096, 'hidden_dim': 64, 'learning_rate': .001,
-                                'baseline_offset': 'prior_batch_mean', 'update_mode': args.update_mode}}
+                                'baseline_offset': args.baseline_offset, 'update_mode': args.update_mode}}
     if args.projection_backend != 'numpy':
         config['policy_config']['projection_backend'] = args.projection_backend
     return config
@@ -167,7 +197,7 @@ def import_completed_checkpoint(args, config, trainer_class=NeuralTrainer):
             raise ValueError('imported ' + key + ' differs from requested configuration')
     episode_config = {'max_seconds': 1800, 'max_steps': 1000, 'public_score': True,
                       **config['episode_config'], 'scoring_mode': config['scoring_mode']}
-    representation = {2: 'public_v2_split', 3: 'public_v3_spatial'}[config['observation_schema']]
+    representation = {2: 'public_v2_split', 3: 'public_v3_spatial', 4: 'public_v4_contacts'}[config['observation_schema']]
     policy_config = NeuralPolicy(seed=config['seed'], representation=representation,
                                  **config['policy_config']).config
     if trainer.episode_config != episode_config or trainer.policy.config != policy_config:
@@ -246,14 +276,15 @@ def _run_locked(args, run_id, output, trainer_class, replay_exporter):
     config = requested_config(args)
     source = source_manifest()
     manifest_path = directory / 'manifest.json'
-    checkpoint_path = directory / 'checkpoint.json'
+    checkpoint_path = directory / ('checkpoint.' + args.checkpoint_format)
     training_path = directory / 'training.json'
     evaluation_path = directory / 'evaluation.json'
     replay_path = directory / 'replay.json'
     records, previous_elapsed = [], 0
     if args.resume:
         manifest = json.loads(manifest_path.read_text())
-        if manifest['source'] != source or manifest['config'] != config:
+        if (manifest['source'] != source or manifest['config'] != config or
+                manifest.get('checkpoint_format', 'json') != args.checkpoint_format):
             raise ValueError('incompatible source or training configuration; start a new run')
         trainer = trainer_class.load(checkpoint_path, args.snapshot, allow_real=True)
         saved = json.loads(training_path.read_text())
@@ -274,6 +305,8 @@ def _run_locked(args, run_id, output, trainer_class, replay_exporter):
         manifest = {'schema_version': 1, 'run_id': run_id, 'commit': git_commit(), 'source': source,
                     'snapshot': trainer.manifest, 'config': config, 'offline_only': True,
                     'backend': args.projection_backend + '_cpu', 'threads': 1}
+        if args.checkpoint_format != 'json':
+            manifest['checkpoint_format'] = args.checkpoint_format
         if import_audit is not None:
             manifest['initialization'] = import_audit
             atomic_json(directory / 'import-audit.json', import_audit)
@@ -317,14 +350,17 @@ def _run_locked(args, run_id, output, trainer_class, replay_exporter):
                                     'episodes_attempted': trainer.episodes_attempted,
                                     'episodes_completed': trainer.episodes_completed,
                                     'optimizer_updates': trainer.policy.steps})
-        atomic_json(checkpoint_path, trainer.checkpoint())
+        if args.checkpoint_format == 'npz':
+            atomic_npz(checkpoint_path, trainer)
+        else:
+            atomic_json(checkpoint_path, trainer.checkpoint())
         state['checkpoint'], state['latest_report'] = relative(checkpoint_path), relative(training_path)
     try:
         save()
         progress('training')
         while trainer.episodes_attempted < args.episodes and not should_stop():
             tick = time.monotonic()
-            records.extend(trainer.train(1))
+            records.extend(trainer.train(1, **({"diagnostics": True} if args.training_diagnostics else {})))
             training_elapsed += time.monotonic() - tick
             if trainer.episodes_attempted % args.checkpoint_every == 0:
                 save()
@@ -334,10 +370,11 @@ def _run_locked(args, run_id, output, trainer_class, replay_exporter):
             progress('interrupted')
             return 130
         progress('evaluating', 'evaluation')
-        before = canonical(trainer.checkpoint())
+        fingerprint = (lambda: state_digest(trainer.checkpoint(arrays=True))) if args.checkpoint_format == 'npz' else (lambda: canonical(trainer.checkpoint()))
+        before = fingerprint()
         tick = time.monotonic()
         evaluation = trainer.evaluate()
-        if canonical(trainer.checkpoint()) != before:
+        if fingerprint() != before:
             raise RuntimeError('evaluation changed checkpoint state')
         atomic_json(evaluation_path, {'evaluation': evaluation,
                     'paired_comparison': paired_deltas(evaluation, trainer.heldout_seeds),

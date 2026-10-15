@@ -17,13 +17,17 @@ class Decision:
     observation: tuple
     candidates: tuple
     selected: int
+    # None denotes legacy decisions; zero is a valid explicitly observed score.
+    public_score_offset: float | None = None
 
-    def to_dict(self):
+    def to_dict(self, *, arrays=False):
         def pair(value):
-            return [value[0].tolist(), value[1].tolist()]
+            return list(value) if arrays else [value[0].tolist(), value[1].tolist()]
         return {"observation": pair(self.observation),
                 "candidates": [pair(value) for value in self.candidates],
-                "selected": self.selected}
+                "selected": self.selected,
+                **({"public_score_offset": self.public_score_offset}
+                   if self.public_score_offset is not None else {})}
 
     @classmethod
     def from_dict(cls, data):
@@ -36,7 +40,11 @@ class Decision:
         candidates = tuple(pair(value) for value in data["candidates"])
         if isinstance(selected, bool) or not isinstance(selected, int) or not 0 <= selected < len(candidates):
             raise ValueError("invalid selected candidate")
-        return cls(pair(data["observation"]), candidates, selected)
+        offset = data.get("public_score_offset")
+        if "public_score_offset" in data and (isinstance(offset, bool) or
+                not isinstance(offset, (int, float)) or not math.isfinite(offset)):
+            raise ValueError("invalid public score offset")
+        return cls(pair(data["observation"]), candidates, selected, offset)
 
 
 class NeuralPolicy:
@@ -53,12 +61,12 @@ class NeuralPolicy:
         self.config = dict(seed=seed, buckets=buckets, hidden_dim=hidden_dim,
                            learning_rate=learning_rate, gradient_clip=gradient_clip,
                            hash_seed=hash_seed)
-        if representation not in ("legacy_json", "public_v2_split", "public_v3_spatial"):
+        if representation not in ("legacy_json", "public_v2_split", "public_v3_spatial", "public_v4_contacts"):
             raise ValueError("unsupported policy representation")
         # Omit the legacy default to preserve the original checkpoint format.
         if representation != "legacy_json":
             self.config["representation"] = representation
-        if baseline_offset not in ("none", "prior_batch_mean"):
+        if baseline_offset not in ("none", "prior_batch_mean", "public_own_score"):
             raise ValueError("unsupported baseline offset")
         if baseline_offset != "none":
             self.config["baseline_offset"] = baseline_offset
@@ -83,7 +91,7 @@ class NeuralPolicy:
             self.config["projection_backend"] = projection_backend
         self.return_mean = 0.0
         self.return_count = 0
-        self.feature_width = buckets * (2 if representation in ("public_v2_split", "public_v3_spatial") else 1)
+        self.feature_width = buckets * (2 if representation in ("public_v2_split", "public_v3_spatial", "public_v4_contacts") else 1)
         self.rng = np.random.default_rng(seed)
         self.params = {"observation": self.rng.normal(0, 0.05, (self.feature_width, hidden_dim)),
                        "action": self.rng.normal(0, 0.05, (self.feature_width, hidden_dim)),
@@ -218,19 +226,35 @@ class NeuralPolicy:
     def _decision(self, observation, candidates, selected=0):
         if not candidates:
             raise ValueError("policy needs at least one supplied candidate")
+        public_score_offset = None
+        if self.config.get("baseline_offset") == "public_own_score":
+            score = observation.get("score") if isinstance(observation, dict) else None
+            public_score_offset = score.get("own") if isinstance(score, dict) else None
+            if (isinstance(public_score_offset, bool) or
+                    not isinstance(public_score_offset, (int, float)) or
+                    not math.isfinite(public_score_offset)):
+                raise ValueError("public_own_score requires a finite public observation score.own")
         representation = self.config.get("representation", "legacy_json")
-        if representation in ("public_v2_split", "public_v3_spatial"):
-            schema = 2 if representation == "public_v2_split" else 3
+        if representation in ("public_v2_split", "public_v3_spatial", "public_v4_contacts"):
+            schema = {"public_v2_split": 2, "public_v3_spatial": 3, "public_v4_contacts": 4}[representation]
             if not isinstance(observation, dict) or observation.get("schema_version") != schema or "board" not in observation:
                 raise ValueError(f"{representation} requires a schema-v{schema} public observation")
             if any(not isinstance(a, dict) or set(a) != {"action", "public_context"} for a in candidates):
                 raise ValueError(f"{representation} requires public candidate views")
-            if schema == 3 and any("objective_relations" not in a["public_context"] for a in candidates):
-                raise ValueError("public_v3_spatial requires public objective relations")
+            if schema in (3, 4) and any("objective_relations" not in a["public_context"] for a in candidates):
+                raise ValueError(f"{representation} requires public objective relations")
+            if schema == 4:
+                fields = {"intended_endpoint_is_public_objective",
+                          "intended_endpoint_is_unowned_public_objective",
+                          "acting_unit_is_ground_type1or2"}
+                if any(set(a["public_context"].get("objective_contacts", {})) != fields or
+                       any(type(v) is not bool for v in a["public_context"]["objective_contacts"].values())
+                       for a in candidates):
+                    raise ValueError("public_v4_contacts requires Boolean public objective contacts")
             dynamic = {k: v for k, v in observation.items() if k != "board"}
             return Decision(self._split_features(dynamic, observation["board"], cache_second=True),
-                            tuple(self._split_features(a["action"], a["public_context"]) for a in candidates), selected)
-        return Decision(self._features(observation), tuple(self._features(a) for a in candidates), selected)
+                            tuple(self._split_features(a["action"], a["public_context"]) for a in candidates), selected, public_score_offset)
+        return Decision(self._features(observation), tuple(self._features(a) for a in candidates), selected, public_score_offset)
 
     def probabilities(self, observation, candidates):
         return self._forward(self._decision(observation, candidates))[3]
@@ -239,7 +263,7 @@ class NeuralPolicy:
         record = self._decision(observation, candidates)
         probs = self._forward(record)[3]
         index = int(self.rng.choice(len(candidates), p=probs))
-        result = (candidates[index], Decision(record.observation, record.candidates, index))
+        result = (candidates[index], Decision(record.observation, record.candidates, index, record.public_score_offset))
         return (*result, probs) if return_probabilities else result
 
     def select(self, observation, candidates):
@@ -247,8 +271,16 @@ class NeuralPolicy:
 
     __call__ = select
 
+    def _validate_decision_offset(self, decision):
+        offset = decision.public_score_offset
+        if self.config.get("baseline_offset") == "public_own_score":
+            if isinstance(offset, bool) or not isinstance(offset, (int, float)) or not math.isfinite(offset):
+                raise ValueError("public_own_score requires an explicitly stored finite decision offset")
+        elif offset is not None:
+            raise ValueError("public score decision offset requires public_own_score mode")
+
     def _loss_gradients(self, examples, advantages=None, actor_normalizer=None, baseline_offset=0.0,
-                        old_log_probs=None):
+                        old_log_probs=None, diagnostics=None):
         """Actor sum / actor_normalizer + mean half squared value error.
 
         Explicit advantages are for derivative checks; update computes them once
@@ -262,6 +294,13 @@ class NeuralPolicy:
             actor_normalizer = count
         if actor_normalizer <= 0:
             raise ValueError("actor normalizer must be positive")
+        if self.config.get("baseline_offset") == "public_own_score":
+            if baseline_offset != 0.0:
+                raise ValueError("public_own_score and prior batch offset are mutually exclusive")
+            for decision, _ in examples:
+                self._validate_decision_offset(decision)
+            # A fixed observation-only baseline, NOT intermediate rewards.
+            examples = [(d, score - d.public_score_offset) for d, score in examples]
         # The offset is fixed from prior completed batches, never this batch.
         # These residual targets are internal critic targets, not changed returns.
         if baseline_offset != 0.0:
@@ -302,6 +341,10 @@ class NeuralPolicy:
                         raise FloatingPointError("unrepresentable PPO surrogate") from exc
                     actor_weight = surrogate
                 loss += -surrogate / actor_normalizer + 0.5 * (value - score) ** 2 / count
+            if diagnostics is not None:
+                diagnostics.observe(i, adv, probs, log_probs,
+                                    log_ratio if old_log_probs is not None else None,
+                                    clipped if old_log_probs is not None else False)
             dlogits = probs.copy()
             dlogits[decision.selected] -= 1
             dlogits *= actor_weight / actor_normalizer
@@ -327,7 +370,7 @@ class NeuralPolicy:
                     np.add.at(gradients["action"], indices, values[:, None] * derivative)
         return float(loss), gradients
 
-    def update_batch(self, trajectories):
+    def update_batch(self, trajectories, *, diagnostic_seats=None):
         """Update from [(completed own-seat decisions, raw own terminal score)].
 
         The caller must exclude truncated/unfinished trajectories. No intermediate
@@ -337,17 +380,29 @@ class NeuralPolicy:
         Value regression remains a mean over decisions.
         """
         examples = []
+        example_seats = []
         trajectory_count = 0
         scores = []
         for history, score in trajectories:
             if isinstance(score, bool) or not isinstance(score, (int, float)) or not math.isfinite(score):
                 raise ValueError("terminal score must be finite")
+            if diagnostic_seats is not None:
+                if trajectory_count >= len(diagnostic_seats) or diagnostic_seats[trajectory_count] not in ("BLUE", "RED", "UNKNOWN"):
+                    raise ValueError("diagnostic seats must match trajectories")
+                example_seats.extend([diagnostic_seats[trajectory_count]] * len(history))
             trajectory_count += 1
             scores.append(float(score))
             for decision in history:
                 if not isinstance(decision, Decision) or not 0 <= decision.selected < len(decision.candidates):
                     raise ValueError("invalid decision")
+                self._validate_decision_offset(decision)
                 examples.append((decision, float(score)))
+        if diagnostic_seats is not None and len(diagnostic_seats) != trajectory_count:
+            raise ValueError("diagnostic seats must match trajectories")
+        diagnostics = None
+        if diagnostic_seats is not None:
+            from .training_diagnostics import EpochDiagnostics
+            diagnostics = EpochDiagnostics(example_seats, self.config.get("ppo_clip"))
         use_offset = self.config.get("baseline_offset", "none") == "prior_batch_mean"
         offset = self.return_mean if use_offset else 0.0
         # Stage statistics without exposing current returns to the loss. Iterating
@@ -361,19 +416,21 @@ class NeuralPolicy:
             if not math.isfinite(next_mean):
                 raise FloatingPointError("non-finite running mean; parameters unchanged")
         if self.config.get("update_mode") == "ppo_clip" and examples:
-            result = self._update_ppo(examples, trajectory_count, offset)
+            result = self._update_ppo(examples, trajectory_count, offset, diagnostic_seats=example_seats if diagnostics is not None else None)
             self.return_mean, self.return_count = next_mean, next_count
             return result
         loss, gradients = self._loss_gradients(examples, actor_normalizer=trajectory_count,
-                                              baseline_offset=offset)
+                                              baseline_offset=offset, diagnostics=diagnostics)
         if not examples:
             # A completed no-decision episode counts once; an empty batch does
             # nothing. There is no optimizer step when there are no decisions.
             self.return_mean, self.return_count = next_mean, next_count
-            return {"decisions": 0, "loss": loss, "gradient_norm": 0.0}
+            return {"decisions": 0, "loss": loss, "gradient_norm": 0.0,
+                    **({"diagnostics": {"epochs": [diagnostics.report()]}} if diagnostics is not None else {})}
         norm = self._apply_gradients(loss, gradients)
         self.return_mean, self.return_count = next_mean, next_count
-        return {"decisions": len(examples), "loss": loss, "gradient_norm": norm}
+        return {"decisions": len(examples), "loss": loss, "gradient_norm": norm,
+                **({"diagnostics": {"epochs": [diagnostics.report()]}} if diagnostics is not None else {})}
 
     def _apply_gradients(self, loss, gradients):
         norm = math.sqrt(sum(float(np.sum(g * g)) for g in gradients.values()))
@@ -390,7 +447,7 @@ class NeuralPolicy:
             self.params[key] -= self.config["learning_rate"] * mhat / (np.sqrt(vhat) + 1e-8)
         return norm
 
-    def _update_ppo(self, examples, trajectory_count, offset):
+    def _update_ppo(self, examples, trajectory_count, offset, *, diagnostic_seats=None):
         # The trainer collects every pending trajectory under unchanged params.
         # Recompute the behavior policy once before ANY optimizer step; never
         # refresh old values/log-probabilities/advantages during these epochs.
@@ -401,15 +458,25 @@ class NeuralPolicy:
         old_log_probs = tuple(log_prob for log_prob, _ in old)
         old_values = tuple(value for _, value in old)
         advantages = tuple(score - offset - value for (_, score), value in zip(examples, old_values))
+        if self.config.get("baseline_offset") == "public_own_score":
+            advantages = tuple(score - d.public_score_offset - value
+                               for (d, score), value in zip(examples, old_values))
         del old
         backup = ({k: v.copy() for k, v in self.params.items()},
                   {k: v.copy() for k, v in self.m.items()},
                   {k: v.copy() for k, v in self.v.items()}, self.steps)
+        epoch_reports = []
         try:
             for _ in range(self.config["update_epochs"]):
+                diagnostics = None
+                if diagnostic_seats is not None:
+                    from .training_diagnostics import EpochDiagnostics
+                    diagnostics = EpochDiagnostics(diagnostic_seats, self.config["ppo_clip"])
                 loss, gradients = self._loss_gradients(
                     examples, advantages, actor_normalizer=trajectory_count,
-                    baseline_offset=offset, old_log_probs=old_log_probs)
+                    baseline_offset=offset, old_log_probs=old_log_probs, diagnostics=diagnostics)
+                if diagnostics is not None:
+                    epoch_reports.append(diagnostics.report())
                 norm = self._apply_gradients(loss, gradients)
                 if not all(np.isfinite(v).all() for group in (self.params, self.m, self.v) for v in group.values()):
                     raise FloatingPointError("non-finite PPO optimizer state")
@@ -417,19 +484,20 @@ class NeuralPolicy:
             self.params, self.m, self.v, self.steps = backup
             raise
         return {"decisions": len(examples), "loss": loss, "gradient_norm": norm,
-                "optimizer_steps": self.config["update_epochs"]}
+                "optimizer_steps": self.config["update_epochs"],
+                **({"diagnostics": {"epochs": epoch_reports}} if diagnostic_seats is not None else {})}
 
     @property
     def algorithm(self):
         return "generic_json_ppo_clip" if self.config.get("update_mode") == "ppo_clip" else "generic_json_reinforce"
 
-    def checkpoint(self):
+    def checkpoint(self, *, arrays=False):
         return {"schema_version": 1, "algorithm": self.algorithm,
                 "config": dict(self.config), "steps": self.steps,
                 "rng": self.rng.bit_generator.state,
                 **({"return_baseline": {"mean": self.return_mean, "count": self.return_count}}
                    if self.config.get("baseline_offset") == "prior_batch_mean" else {}),
-                **{name: {k: v.tolist() for k, v in values.items()}
+                **{name: {k: (v if arrays else v.tolist()) for k, v in values.items()}
                    for name, values in (("params", self.params), ("m", self.m), ("v", self.v))}}
 
     @classmethod
@@ -471,10 +539,14 @@ class NeuralPolicy:
         return result
 
     def save(self, path):
+        if Path(path).suffix.lower() == ".npz":
+            from .compact_checkpoint import save_compact
+            return save_compact(path, self.checkpoint(arrays=True))
         with Path(path).open("x", encoding="utf-8") as stream:
             json.dump(self.checkpoint(), stream, allow_nan=False, separators=(",", ":"))
             stream.write("\n")
 
     @classmethod
     def load(cls, path):
-        return cls.from_checkpoint(json.loads(Path(path).read_text("utf-8")))
+        from .compact_checkpoint import read_checkpoint
+        return cls.from_checkpoint(read_checkpoint(path))

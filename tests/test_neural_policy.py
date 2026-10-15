@@ -146,7 +146,17 @@ class NeuralPolicyTests(unittest.TestCase):
         tree = ast.parse(source)
         imports = [n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)]
         imports += [alias.name for n in ast.walk(tree) if isinstance(n, ast.Import) for alias in n.names]
-        self.assertEqual(set(imports), {"dataclasses", "hashlib", "json", "math", "pathlib", "numpy", "scipy.sparse"})
+        self.assertEqual(set(imports), {"dataclasses", "hashlib", "json", "math", "pathlib", "numpy", "scipy.sparse", "compact_checkpoint", "training_diagnostics"})
+        import env.training_diagnostics as diagnostics
+        diagnostics_tree = ast.parse(inspect.getsource(diagnostics))
+        diagnostics_imports = [n.module for n in ast.walk(diagnostics_tree) if isinstance(n, ast.ImportFrom)]
+        diagnostics_imports += [a.name for n in ast.walk(diagnostics_tree) if isinstance(n, ast.Import) for a in n.names]
+        self.assertEqual(set(diagnostics_imports), {"math", "numpy"})
+        import env.compact_checkpoint as transport
+        transport_tree = ast.parse(inspect.getsource(transport))
+        transport_imports = [n.module for n in ast.walk(transport_tree) if isinstance(n, ast.ImportFrom)]
+        transport_imports += [a.name for n in ast.walk(transport_tree) if isinstance(n, ast.Import) for a in n.names]
+        self.assertEqual(set(transport_imports), {"json", "math", "pathlib", "zipfile", "numpy", "hashlib"})
         self.assertNotIn("getattr(env", source)
 
 

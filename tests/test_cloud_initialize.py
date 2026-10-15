@@ -73,7 +73,8 @@ class InitializeTests(unittest.TestCase):
             self.assertFalse((self.root/'output/child').exists())
         for group,key,value in [('episode_config','move_radius',3),('episode_config','max_seconds',1800),
                     ('episode_config','max_steps',1000),('policy_config','learning_rate',.01),
-                    ('policy_config','projection_backend','numpy')]:
+                    ('policy_config','projection_backend','numpy'),
+                    ('policy_config','baseline_offset','public_own_score')]:
             config=copy.deepcopy(self.config);config[group][key]=value
             with self.subTest(key=key),self.assertRaisesRegex(ValueError,'configuration'):
                 cloud_train.import_completed_checkpoint(self.args,config)

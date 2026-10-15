@@ -309,7 +309,7 @@ class PublicNeuralTrainingTests(NeuralTrainingTests):
         trainer = self.trainer()
         self.assertEqual(trainer.checkpoint()["observation_schema"], 2)
         self.assertEqual(trainer.policy.config["representation"], "public_v2_split")
-        for schema in (True, 0, 4, 2.0):
+        for schema in (True, 0, 5, 2.0):
             with self.assertRaises(ValueError):
                 NeuralTrainer(self.snapshot, observation_schema=schema)
         with self.assertRaises(ValueError):

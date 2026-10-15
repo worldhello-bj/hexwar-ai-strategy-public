@@ -21,8 +21,10 @@ sys.path.insert(0, str(ROOT))
 from env.episode_api import TwoPlayerEpisode
 from env.match_eval import SIDES, _positive_int, snapshot_manifest
 from env.neural_train import NeuralTrainer, canonical, derived_seed
+from env.compact_checkpoint import state_digest
 from env.public_observation import PublicObservationAdapter
 from env.spatial_observation import SpatialObservationAdapter
+from env.contact_observation import ContactObservationAdapter
 
 
 def export_replay(checkpoint, snapshot, *, seed, learner_side, allow_real=False):
@@ -32,9 +34,9 @@ def export_replay(checkpoint, snapshot, *, seed, learner_side, allow_real=False)
     checkpoint = Path(checkpoint)
     source = checkpoint.read_bytes()
     trainer = NeuralTrainer.load(checkpoint, snapshot, allow_real=allow_real)
-    frozen = canonical(trainer.checkpoint())
+    frozen = state_digest(trainer.checkpoint(arrays=True))
     episode = TwoPlayerEpisode(snapshot, **trainer.episode_config)
-    adapter = {2: PublicObservationAdapter, 3: SpatialObservationAdapter}.get(trainer.observation_schema)
+    adapter = {2: PublicObservationAdapter, 3: SpatialObservationAdapter, 4: ContactObservationAdapter}.get(trainer.observation_schema)
     view = adapter(episode) if adapter else episode
     status = episode.reset(seed=seed)
     opponent_rng = random.Random(derived_seed(trainer.seed, seed, learner_side, "opponent"))
@@ -45,7 +47,7 @@ def export_replay(checkpoint, snapshot, *, seed, learner_side, allow_real=False)
     while not status["terminated"] and not status["truncated"]:
         side = status["current_actor"]
         candidates = (view.candidate_views(side)
-                      if side == learner_side and trainer.observation_schema in (2, 3)
+                      if side == learner_side and trainer.observation_schema in (2, 3, 4)
                       else episode.legal_actions(side))
         if not candidates:
             status = {**status, "terminated": False, "truncated": True,
@@ -56,7 +58,7 @@ def export_replay(checkpoint, snapshot, *, seed, learner_side, allow_real=False)
             probabilities = trainer.policy.probabilities(observation, candidates)
             selected = int(eval_rng.choice(len(candidates), p=probabilities))
             original_actions = ([candidate["action"] for candidate in candidates]
-                                if trainer.observation_schema in (2, 3) else candidates)
+                                if trainer.observation_schema in (2, 3, 4) else candidates)
             action = original_actions[selected]
             decisions.append(copy.deepcopy({
                 "decision_index": len(decisions), "step": status["steps"],
@@ -64,7 +66,7 @@ def export_replay(checkpoint, snapshot, *, seed, learner_side, allow_real=False)
                 "candidates": [{"index": i, "action": original_actions[i],
                                 "probability": float(p),
                                 **({"public_context": candidates[i]["public_context"]}
-                                   if trainer.observation_schema in (2, 3) else {})}
+                                   if trainer.observation_schema in (2, 3, 4) else {})}
                                for i, p in enumerate(probabilities)],
                 "selected_index": selected, "selected_action": action,
                 "selected_probability": float(probabilities[selected]),
@@ -95,7 +97,7 @@ def export_replay(checkpoint, snapshot, *, seed, learner_side, allow_real=False)
     if "score" in final_observation:
         ending["public_score"] = final_observation["score"]
     review_points.append({"kind": "game_end" if completed else "truncation", **ending})
-    if canonical(trainer.checkpoint()) != frozen:
+    if state_digest(trainer.checkpoint(arrays=True)) != frozen:
         raise RuntimeError("replay mutated loaded parameters, optimizer, RNG or counters")
     if checkpoint.read_bytes() != source:
         raise RuntimeError("source checkpoint changed during replay")
@@ -116,7 +118,7 @@ def export_replay(checkpoint, snapshot, *, seed, learner_side, allow_real=False)
             "caveat": "One sampled trajectory of the learned stochastic policy, not a complete strategy table, a win claim, or preset tactics. Review markers show observed changes only; they do not identify causes. Opponent actions and private state are not exported. Truncation is not a scored result."}
 
 
-    if trainer.observation_schema in (2, 3):
+    if trainer.observation_schema in (2, 3, 4):
         report["public_board"] = copy.deepcopy(initial_observation["board"])
         for observation in [initial_observation, final_observation,
                             *[d["observation"] for d in decisions],
