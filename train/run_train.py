@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""规则强化训练环境 —— 统一入口（train/ 自包含副本内使用）。
+"""规则强化训练环境 —— 统一入口（自包含副本，或直接用仓库根的核心）。
 
 这套环境的**唯一想定就是比赛初设**：想定 7527「城市攻防作战（2V2）」的真实地图、
 编成与夺控点（随仓库公开在 `../scenario/7527/`，来历与权利说明见那里的 README）。
@@ -11,6 +11,12 @@
 做成默认行为：
 
     py -3.13 run_train.py train --algo ppo --config configs/ppo_realmap.json
+
+★ 边界（别把它当正确性证明）：规则门只证明"**已被线上实测证过的点没有被改动破坏**"，
+  缺脚本/跑不动一律**硬失败**（绝不"跳过"后报成功）。没有实测样本覆盖的地方
+  （表4 攻级 1–6/8、间瞄、反应装甲、终局结算）它不过问 —— 那得靠继续采样对账。
+  CI 里同时跑 `run_train.py rules` 与 `run_train.py mc`：把"能训练"交给机器证，
+  而不是靠维护者（或 AI）声明。
 
 子命令
 ------
@@ -24,6 +30,12 @@
   train       **推荐**：先跑规则门，过了再按 --algo 训练
   diff        枚举等价性差分（快口径 vs 深度校验）
   check       train/ 与核心仓库的漂移检查（MANIFEST.json）
+
+★ 两种布局都能跑（本入口自己判别）：
+  A. **自包含副本** —— `tools/build_train_env.py` 生成，`train/` 里有 engine/env/tools/scenario；
+  B. **直接用仓库根的核心** —— 公开克隆就是这种（`train/` 里只有本文件与 configs）。
+  判别方式：`train/engine` 与 `train/tools/verify_rules.py` 在不在。
+  找不到核心时**直接报错**，不会把规则门变成空转。
 
 约定
 ----
@@ -39,15 +51,20 @@ import subprocess
 import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(HERE)
 PY = sys.executable
+_CORE = []
 
 # ★ 训练环境只有**比赛初设**：想定 7527「城市攻防作战（2V2）」的真实地图与编成，
 #   随仓库分发在 ../scenario/7527/（工具 tools/publish_scenario.py，出处见其 README）。
 #   配置里不写 snapshot 时就用它 —— 不提供任何合成 demo。
 DEFAULT_SCENARIO = "../scenario/7527"
 
-# 每条规则门 = (显示名, [脚本相对 train/ 的路径])
+# 每条规则门 = (显示名, 脚本相对**核心根**的路径)；核心根由 core_root() 判别
+# ★ 顺序即重要性：先自检（几何/通视/机动/裁决/夺控），再逐张表与条款，最后计分对账。
+#   文档里写的是"自检 + 4 份规则校验 + 计分对账"——实现必须与之一致（曾漏掉 selftest）。
 RULES_GATE = [
+    ("引擎自检", "tools/selftest_engine.py"),
     ("裁决表", "tools/verify_tables.py"),
     ("推演规则", "tools/verify_rules.py"),
     ("新增规则", "tools/verify_rules_extra.py"),
@@ -112,6 +129,34 @@ MODULE = {"mc": "env.selfplay", "ppo": "env.neural_train", "eval": "env.policy_e
           "run_episode": "env.run_episode", "diff": "tools.hex_env_diff"}
 
 
+def core_root():
+    """定位"核心"（engine/ env/ tools/ scenario/ 所在目录），两种布局都支持。
+
+    A 自包含副本：`train/` 里就有 engine/ + tools/verify_rules.py（build_train_env 生成）；
+    B 直接用仓库根：公开克隆就这样（`train/` 里只有本文件与 configs）；
+    都找不到就**报错**—— 否则规则门会静默变成空转（曾静默跳过 5 项还报"通过"）。
+    """
+    if _CORE:
+        return _CORE[0]
+    for cand in (HERE, REPO):
+        if os.path.isdir(os.path.join(cand, "engine")) and \
+                os.path.exists(os.path.join(cand, "tools", "verify_rules.py")):
+            _CORE.append(cand)
+            return cand
+    raise SystemExit(
+        "找不到核心：%s 与 %s 都不是仓库根（缺 engine/ 或 tools/verify_rules.py）。\n"
+        "请在仓库里运行；或在主仓库用 tools/build_train_env.py 生成 train/ 自包含副本。"
+        % (HERE, REPO))
+
+
+def core_env():
+    """子进程环境：把核心目录放进 PYTHONPATH（`-m env.*` 才能 import 到）。"""
+    env = os.environ.copy()
+    env["PYTHONPATH"] = core_root() + os.pathsep + env.get("PYTHONPATH", "")
+    env.setdefault("PYTHONUTF8", "1")
+    return env
+
+
 def load_cfg(path, sub):
     if not path:
         return {}
@@ -147,15 +192,18 @@ def run(cmd, title=None):
     if title:
         print("\n$ %s" % title)
     print("$ " + " ".join(cmd))
-    rc = subprocess.run(cmd, cwd=HERE).returncode
+    # cwd 恒为 train/（配置里的相对路径都按 train/ 解析）；
+    # 核心靠 PYTHONPATH 注入 —— cwd 在 train/ 时 `-m env.*` 也能 import 到。
+    rc = subprocess.run(cmd, cwd=HERE, env=core_env()).returncode
     if rc:
         print("!! 退出码 %d" % rc)
     return rc
 
 
-def py_script(rel, argv):
+def py_script(rel, argv, root=None):
+    """跑核心里的脚本：<root>/<rel>（绝对路径，cwd 用核心根，与手工运行一致）。"""
     os.makedirs(os.path.join(HERE, "analysis"), exist_ok=True)
-    return [PY, rel] + argv
+    return [PY, os.path.join(root or core_root(), rel)] + argv
 
 
 def py_module(name, argv):
@@ -171,23 +219,36 @@ def ensure_dirs(cfg):
 
 
 def rules_gate(live=False):
-    fails = []
+    """规则门：缺脚本 / 跑失败都算**不通过**（绝不静默跳过）。
+
+    `--live` 的两项需要封存区里的线上样本，公开克隆里没有 → 脚本自己会说明并退出 0
+      （那是"没样本可对"，不是"跳过检查"）。
+    """
+    root = core_root()
+    fails, missing = [], []
     for name, rel in RULES_GATE + (RULES_LIVE if live else []):
-        if not os.path.exists(os.path.join(HERE, rel)):
-            print("  跳过 %-14s（%s 不存在）" % (name, rel))
+        path = os.path.join(root, rel)
+        if not os.path.exists(path):
+            print("  ❌ %-14s 找不到 %s" % (name, path))
+            missing.append(rel)
             continue
-        p = subprocess.run([PY, rel], cwd=HERE, capture_output=True, text=True)
+        p = subprocess.run([PY, path], cwd=root, env=core_env(),
+                           capture_output=True, text=True)
         tail = (p.stdout or "").strip().splitlines()[-1:] or \
                (p.stderr or "").strip().splitlines()[-1:]
         ok = p.returncode == 0
         print("  %s %-14s %s" % ("✅" if ok else "❌", name, tail))
         if not ok:
             fails.append((name, rel, tail))
+    if missing:
+        print("\n规则门无法执行：缺 %s" % missing)
+        print("⇒ 别在缺检查的情况下开训（那等于规则无人看守）。")
+        return 1
     if fails:
         print("\n规则门未通过：%s" % [f[0] for f in fails])
         print("⇒ 规则不对就别开训（否则学的是错规则）。先修引擎/表，再看上面各脚本的输出。")
         return 1
-    print("\n规则门通过 ✅（引擎与已实测规则一致）")
+    print("\n规则门通过 ✅（引擎与已实测规则一致；核心：%s）" % root)
     return 0
 
 
@@ -206,7 +267,13 @@ def main():
     if args.cmd == "selftest":
         return run(py_script("tools/selftest_engine.py", []))
     if args.cmd == "check":
-        return run([PY, os.path.join("..", "tools", "build_train_env.py"), "--check"])
+        # 布局 B（直接用仓库根的核心）下 train/ 不是副本，漂移检查无从谈起
+        if core_root() != HERE:
+            print("当前是「直接用仓库根」布局：train/ 里没有生成副本，无需同步检查。")
+            print("（自包含副本由 tools/build_train_env.py 生成，那边跑 check 才有意义。）")
+            return 0
+        return run([PY, os.path.join(core_root(), "tools", "build_train_env.py"),
+                    "--check"])
 
     sub = {"env": "run_episode", "mc": "mc", "ppo": "ppo", "eval": "eval",
            "diff": "diff", "train": args.algo}[args.cmd]
