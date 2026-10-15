@@ -32,6 +32,7 @@ CAP = os.path.join(ROOT, "archive", "exploration", "capture", "7527_transport_ca
 if not os.path.isdir(CAP):
     CAP = os.path.join(ROOT, "7527_transport_capture")
 OUT = os.path.join(ROOT, "analysis", "_live_crt_check.txt")
+os.makedirs(os.path.dirname(OUT), exist_ok=True)   # 公开克隆里可能没有 analysis/
 RE_TGT = re.compile(r"目标 (Obj_\d+)\((?:ico=)?\S+ typeid=(\d+)")
 RE_SAMPLE = re.compile(
     r"◆ 裁决#(\d+) 距离=(\S+) 攻级=(\S+) 随机数=(\S+) 结果=(\S+) 装甲=(\S+) "

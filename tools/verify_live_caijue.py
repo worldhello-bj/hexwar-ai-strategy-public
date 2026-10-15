@@ -29,6 +29,7 @@ CAP = os.path.join(ROOT, "archive", "exploration", "capture", "7527_transport_ca
 if not os.path.isdir(CAP):
     CAP = os.path.join(ROOT, "7527_transport_capture")
 OUT = os.path.join(ROOT, "analysis", "_live_caijue_check.txt")
+os.makedirs(os.path.dirname(OUT), exist_ok=True)   # 公开克隆里可能没有 analysis/
 
 # 裁决页「射击方状态」→ engine 参数
 SHOOTER = {"机动中": "shooter_moving", "被压制": "shooter_stunned", "静止": None}

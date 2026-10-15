@@ -9,6 +9,7 @@ from engine import Game, geometry as G, crt
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 OUT = os.path.join(ROOT, "analysis", "engine_selftest.md")
+os.makedirs(os.path.dirname(OUT), exist_ok=True)   # 公开克隆里可能没有 analysis/
 L = []
 def w(x=""):
     L.append(str(x))

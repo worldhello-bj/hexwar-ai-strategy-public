@@ -32,7 +32,9 @@ CAP = os.path.join(ROOT, "archive", "exploration", "capture", "7527_transport_ca
 if not os.path.isdir(CAP):
     CAP = os.path.join(ROOT, "7527_transport_capture")
 OUT_JSON = os.path.join(ROOT, "engine", "empirical_tables.json")
+os.makedirs(os.path.dirname(OUT_JSON), exist_ok=True)   # 公开克隆里可能没有 analysis/
 OUT_MD = os.path.join(ROOT, "docs", "实测裁决表.md")
+os.makedirs(os.path.dirname(OUT_MD), exist_ok=True)   # 公开克隆里可能没有 analysis/
 
 ARMORS = ("复合装甲", "重型装甲", "中型装甲", "轻型装甲", "无装甲")
 ROLLS = list(range(2, 13))

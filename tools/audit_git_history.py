@@ -24,6 +24,7 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REPORT = os.path.join(ROOT, "analysis", "publish_history_audit.md")
+os.makedirs(os.path.dirname(REPORT), exist_ok=True)   # 公开克隆里可能没有 analysis/
 
 FORBIDDEN_PATHS = [
     r"\.har$", r"\.chlsj$", r"\.pcap$",

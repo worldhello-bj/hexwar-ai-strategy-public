@@ -30,6 +30,7 @@ CAP = os.path.join(ROOT, "archive", "exploration", "capture", "7527_transport_ca
 if not os.path.isdir(CAP):
     CAP = os.path.join(ROOT, "7527_transport_capture")
 OUT = os.path.join(ROOT, "analysis", "_derive_table4.txt")
+os.makedirs(os.path.dirname(OUT), exist_ok=True)   # 公开克隆里可能没有 analysis/
 TABLES = os.path.join(ROOT, "engine", "tables.json")
 
 RE_TGT = re.compile(r"目标 (Obj_\d+)\((?:ico=)?\S+ typeid=(\d+)")
