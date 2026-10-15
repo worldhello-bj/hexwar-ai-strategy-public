@@ -2,7 +2,8 @@
 """Bounded fresh-seed evaluation of frozen initial/trained synthetic-game models.
 
 No training or checkpoint changes. Each seed runs both policy seats against
-uniform random, with identical scenario and sampling seeds for both models.
+the saved opponent contract (uniform by default), with identical scenario and
+sampling seeds for both models.
 """
 import argparse
 import hashlib
@@ -74,7 +75,8 @@ def evaluate_checkpoint(checkpoint, snapshot, *, seed_start, seed_count):
         raise RuntimeError("evaluation mutated loaded model, optimizer, RNG or counters")
     if checkpoint.read_bytes() != original_bytes:
         raise RuntimeError("source checkpoint changed during evaluation")
-    return {"schema_version": 1, "evaluation_type": "fresh_frozen_neural_vs_uniform_random",
+    return {"schema_version": 1, "evaluation_type": ("fresh_frozen_neural_vs_fixed_pool" if trainer.opponent_pool_manifest
+                                                        else "fresh_frozen_neural_vs_uniform_random"),
             "source_checkpoint_sha256": hashlib.sha256(original_bytes).hexdigest(),
             "source_checkpoint_bytes": len(original_bytes), "snapshot": trainer.manifest,
             "observation_schema": trainer.observation_schema,

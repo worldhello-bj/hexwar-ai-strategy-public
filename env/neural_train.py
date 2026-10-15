@@ -50,7 +50,7 @@ class NeuralTrainer:
     """
     def __init__(self, snapshot, *, seed=0, train_seed_start=0, batch_episodes=4,
                  episode_config=None, policy_config=None, heldout_seeds=(1000000, 1000001),
-                 observation_schema=1, allow_real=False, scoring_mode="verified"):
+                 observation_schema=1, allow_real=False, scoring_mode="verified", opponent_pool=None):
         for name, value in (("seed", seed), ("train_seed_start", train_seed_start)):
             _positive_int(name, value, True)
         _positive_int("batch_episodes", batch_episodes)
@@ -90,6 +90,35 @@ class NeuralTrainer:
         self.episodes_completed = 0
         self.pending = []
         self.updates = 0
+        self._opponent_pool = self._load_opponent_pool(opponent_pool)
+        self._pool_import = None
+
+    def _load_opponent_pool(self, config):
+        if config is None:
+            return None
+        from .frozen_pool import FrozenPool
+        return FrozenPool(config, snapshot=self.manifest, episode_config=self.episode_config,
+                          observation_schema=self.observation_schema, scoring_mode=self.scoring_mode)
+
+    @property
+    def opponent_pool_manifest(self):
+        return self._opponent_pool.manifest if self._opponent_pool else None
+
+    def import_opponent_pool_for_new_run(self, config, *, parent_checkpoint_sha256):
+        """Explicit batch-boundary curriculum import; never a resume override."""
+        if self.pending or not self.episodes_completed:
+            raise ValueError("opponent change requires a completed batch in a new run")
+        if (not isinstance(parent_checkpoint_sha256, str) or len(parent_checkpoint_sha256) != 64 or
+                any(c not in '0123456789abcdef' for c in parent_checkpoint_sha256)):
+            raise ValueError("opponent change requires parent checkpoint SHA256 provenance")
+        previous = self.opponent_pool_manifest
+        replacement = self._load_opponent_pool(config)
+        following = replacement.manifest if replacement else None
+        self._pool_import = {"parent_checkpoint_sha256": parent_checkpoint_sha256,
+                             "at_episode": self.episodes_attempted,
+                             "previous_pool": previous, "new_pool": following}
+        self._opponent_pool = replacement
+        return copy.deepcopy(self._pool_import)
 
     def _rollout(self, policy, episode_seed, learner_side, *, training):
         if snapshot_manifest(self.snapshot, allow_real=self.allow_real) != self.manifest:
@@ -101,12 +130,23 @@ class NeuralTrainer:
         status = episode.reset(seed=episode_seed)
         opponent_rng = random.Random(derived_seed(self.seed, episode_seed, learner_side, "opponent"))
         eval_rng = np.random.default_rng(derived_seed(self.seed, episode_seed, learner_side, "evaluation"))
+        pool = self._opponent_pool
+        opponent_index = None
+        frozen_opponent = False
+        if pool is not None:
+            pool.verify_sources()
+            opponent_index = pool.select(derived_seed(self.seed, episode_seed, "pool-selection-v1"))
+            frozen_opponent = not pool.is_uniform(opponent_index)
+            # Separate adapter state for each seat and independent action RNG.
+            opponent_public = adapter(episode)
+            frozen_rng = np.random.default_rng(derived_seed(self.seed, episode_seed, learner_side, "frozen-opponent-v1"))
         trajectory, entropies, counts = [], [], []
         decisions = 0
         while not status["terminated"] and not status["truncated"]:
             side = status["current_actor"]
             candidates = (public_episode.candidate_views(side)
                           if side == learner_side and self.observation_schema in (2, 3, 4)
+                          else opponent_public.candidate_views(side) if frozen_opponent
                           else episode.legal_actions(side))
             if not candidates:
                 status = {**status, "terminated": False, "truncated": True,
@@ -127,7 +167,10 @@ class NeuralTrainer:
                 decisions += 1
             else:
                 # No opposing observation is ever fetched or supplied to learner.
-                action = opponent_rng.choice(candidates)
+                if frozen_opponent:
+                    action = pool.action(opponent_index, opponent_public.observe(side), candidates, frozen_rng)["action"]
+                else:
+                    action = opponent_rng.choice(candidates)
             if side == learner_side and self.observation_schema in (2, 3, 4):
                 action = action["action"]
             status = episode.step(action, side=side)
@@ -148,6 +191,12 @@ class NeuralTrainer:
                   "decisions": decisions, "mean_entropy": float(np.mean(entropies)) if entropies else None,
                   "mean_candidates": float(np.mean(counts)) if counts else None,
                   "max_candidates": max(counts, default=0), "elapsed_seconds": time.perf_counter() - start}
+        if pool is not None:
+            record["opponent_index"] = opponent_index
+            entry = pool.config["entries"][opponent_index]
+            record["opponent_kind"] = entry["kind"]
+            record["opponent_id"] = entry.get("sha256", "uniform")
+            record["opponent_side"] = SIDES[1 - SIDES.index(learner_side)]
         return record, trajectory
 
     def train(self, episodes=20, *, diagnostics=False):
@@ -197,6 +246,7 @@ class NeuralTrainer:
             raise ValueError("evaluation must use unique reserved heldout seeds")
         from .compact_checkpoint import state_digest
         before = state_digest(self.checkpoint(arrays=True))
+        pool_before = self._opponent_pool.state_digest() if self._opponent_pool else None
         reports = {}
         for label, checkpoint in (("initial", self.initial_policy), ("trained", self.policy.checkpoint(arrays=True))):
             policy = NeuralPolicy.from_checkpoint(checkpoint)
@@ -208,14 +258,20 @@ class NeuralTrainer:
                 side: summary([r for r in games if r["learner_side"] == side]) for side in SIDES}, "games": games}
         if state_digest(self.checkpoint(arrays=True)) != before:
             raise RuntimeError("evaluation mutated trainer")
+        if self._opponent_pool and self._opponent_pool.state_digest() != pool_before:
+            raise RuntimeError("evaluation mutated frozen opponents")
         reports["heldout_seeds"] = list(seeds)
         reports["comparison"] = "Frozen initial and trained stochastic policies versus uniform random; identical paired seeds and seats."
+        if self._opponent_pool:
+            reports["comparison"] = "Frozen initial and trained policies versus fixed pool; identical paired seeds, opponents and seats."
+            reports["opponent_pool"] = self.opponent_pool_manifest
         reports["caveat"] = "Descriptive synthetic-game sample, not a strength claim; truncations excluded from score and W/D/L summaries."
         return reports
 
     @property
     def algorithm(self):
-        return "neural_terminal_ppo_clip_vs_random" if self.policy.config.get("update_mode") == "ppo_clip" else "neural_terminal_reinforce_vs_random"
+        base = "neural_terminal_ppo_clip" if self.policy.config.get("update_mode") == "ppo_clip" else "neural_terminal_reinforce"
+        return base + ("_vs_frozen_pool" if self._opponent_pool else "_vs_random")
 
     def checkpoint(self, *, arrays=False):
         from .compact_checkpoint import json_tree
@@ -232,6 +288,10 @@ class NeuralTrainer:
             "updates": self.updates, "policy": self.policy.checkpoint(arrays=arrays), "initial_policy": self.initial_policy,
             "pending": [{"decisions": [d.to_dict(arrays=arrays) for d in trajectory], "return": score}
                         for trajectory, score in self.pending]}
+        if self._opponent_pool:
+            data["opponent_pool"] = self.opponent_pool_manifest
+        if self._pool_import is not None:
+            data["opponent_pool_import"] = copy.deepcopy(self._pool_import)
         return data if arrays else copy.deepcopy(json_tree(data))
 
     def save(self, path):
@@ -245,7 +305,8 @@ class NeuralTrainer:
     def load(cls, path, snapshot, *, allow_real=False):
         from .compact_checkpoint import read_checkpoint
         data = read_checkpoint(path)
-        if data.get("schema_version") != 1 or data.get("algorithm") not in ("neural_terminal_reinforce_vs_random", "neural_terminal_ppo_clip_vs_random"):
+        if data.get("schema_version") != 1 or data.get("algorithm") not in ("neural_terminal_reinforce_vs_random", "neural_terminal_ppo_clip_vs_random",
+                "neural_terminal_reinforce_vs_frozen_pool", "neural_terminal_ppo_clip_vs_frozen_pool"):
             raise ValueError("unsupported checkpoint")
         # 旧检查点（没有 scoring_version）是在旧计分口径下训练的，奖励不可比：
         # 直接拒绝，而不是静默拿它继续跑。
@@ -257,8 +318,12 @@ class NeuralTrainer:
             raise ValueError("checkpoint episode scoring mode differs")
         trainer = cls(snapshot, observation_schema=data.get("observation_schema", 1), allow_real=allow_real,
                       scoring_mode=data.get("scoring_mode", "verified"),
+                      opponent_pool=data["opponent_pool"]["config"] if "opponent_pool" in data else None,
                       **{k: data[k] for k in ("seed", "train_seed_start", "batch_episodes",
                                               "episode_config", "policy_config", "heldout_seeds")})
+        if trainer.opponent_pool_manifest != data.get("opponent_pool"):
+            raise ValueError("checkpoint frozen opponent pool differs")
+        trainer._pool_import = copy.deepcopy(data.get("opponent_pool_import"))
         if trainer.scoring_mode != data.get("scoring_mode", "verified"):
             raise ValueError("checkpoint scoring mode differs")
         if data["algorithm"] != trainer.algorithm:
@@ -298,6 +363,18 @@ class NeuralTrainer:
             raise ValueError("invalid pending return")
         if any(trainer.train_seed_start <= s < trainer.train_seed_start + trainer.episodes_attempted for s in trainer.heldout_seeds):
             raise ValueError("checkpoint training overlaps heldout seeds")
+        if trainer._pool_import is not None:
+            provenance = trainer._pool_import
+            if (not isinstance(provenance, dict) or set(provenance) != {
+                    "parent_checkpoint_sha256", "at_episode", "previous_pool", "new_pool"} or
+                    provenance["new_pool"] != trainer.opponent_pool_manifest):
+                raise ValueError("invalid opponent import provenance")
+            _positive_int("opponent import episode", provenance["at_episode"], True)
+            digest = provenance["parent_checkpoint_sha256"]
+            if (provenance["at_episode"] > trainer.episodes_attempted or
+                    not isinstance(digest, str) or len(digest) != 64 or
+                    any(c not in '0123456789abcdef' for c in digest)):
+                raise ValueError("invalid opponent import provenance")
         return trainer
 
 

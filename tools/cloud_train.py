@@ -112,6 +112,10 @@ def parser():
     p.add_argument('--resume', action='store_true', help='resume the explicitly named run')
     p.add_argument('--initialize-from', type=Path, help='import a completed batch into a new run; never combines with resume')
     p.add_argument('--parent-training-report', type=Path, help='complete historical training journal matching the imported checkpoint')
+    p.add_argument('--opponent-checkpoint', type=Path, action='append', default=[],
+                   help='fixed NPZ opponent; repeat up to 8 entries; pool changes require new-run import')
+    p.add_argument('--include-uniform-opponent', action='store_true',
+                   help='add uniform legal sampling to a nonempty frozen pool')
     p.add_argument('--episodes', type=int, default=160, help='total attempt budget, including resumed attempts')
     p.add_argument('--checkpoint-format', choices=['json', 'npz'], default='json',
                    help='checkpoint transport for this run; resume requires the same format')
@@ -169,6 +173,10 @@ def requested_config(args):
                                 'baseline_offset': args.baseline_offset, 'update_mode': args.update_mode}}
     if args.projection_backend != 'numpy':
         config['policy_config']['projection_backend'] = args.projection_backend
+    if args.opponent_checkpoint or args.include_uniform_opponent:
+        from env.frozen_pool import describe_pool
+        config['opponent_pool'] = describe_pool(args.opponent_checkpoint,
+                                               include_uniform=args.include_uniform_opponent)
     return config
 
 
@@ -263,6 +271,11 @@ def import_completed_checkpoint(args, config, trainer_class=NeuralTrainer):
              'pending_empty': True,
              'historical_records_preserved': True,
              'parameters_optimizer_rng_preserved': True}
+    current_pool = getattr(trainer, "opponent_pool_manifest", None)
+    current_config = current_pool['config'] if current_pool else None
+    if config.get('opponent_pool') != current_config:
+        audit['opponent_pool_import'] = trainer.import_opponent_pool_for_new_run(
+            config.get('opponent_pool'), parent_checkpoint_sha256=checkpoint_sha)
     return trainer, records, elapsed, audit
 
 
@@ -287,6 +300,10 @@ def _run_locked(args, run_id, output, trainer_class, replay_exporter):
                 manifest.get('checkpoint_format', 'json') != args.checkpoint_format):
             raise ValueError('incompatible source or training configuration; start a new run')
         trainer = trainer_class.load(checkpoint_path, args.snapshot, allow_real=True)
+        actual_pool = getattr(trainer, "opponent_pool_manifest", None)
+        if ((actual_pool['config'] if actual_pool else None) != config.get('opponent_pool') or
+                actual_pool != manifest.get('opponent_pool')):
+            raise ValueError('resume opponent pool differs; explicit new-run import required')
         saved = json.loads(training_path.read_text())
         # Checkpoint is authoritative if a crash occurred between the atomic files.
         records = saved['training'][:trainer.episodes_attempted]
@@ -305,6 +322,8 @@ def _run_locked(args, run_id, output, trainer_class, replay_exporter):
         manifest = {'schema_version': 1, 'run_id': run_id, 'commit': git_commit(), 'source': source,
                     'snapshot': trainer.manifest, 'config': config, 'offline_only': True,
                     'backend': args.projection_backend + '_cpu', 'threads': 1}
+        if getattr(trainer, "opponent_pool_manifest", None) is not None:
+            manifest['opponent_pool'] = trainer.opponent_pool_manifest
         if args.checkpoint_format != 'json':
             manifest['checkpoint_format'] = args.checkpoint_format
         if import_audit is not None:
