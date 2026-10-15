@@ -54,3 +54,6 @@ No training experiment was launched. Existing synthetic regression tests do
 exercise optimizer updates as usual.
 
 Standalone diagnostics validation: 293 tests passed in 6.586 seconds.
+
+For separate opt-in per-episode action/contact/observed-position counters, see
+[public behavior diagnostics](public-behavior-diagnostics.md).

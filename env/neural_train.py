@@ -17,6 +17,7 @@ import numpy as np
 
 from engine import scoring
 from .episode_api import TwoPlayerEpisode
+from .behavior_diagnostics import EpisodeBehaviorDiagnostics
 from .match_eval import SIDES, _positive_int, snapshot_manifest
 from .neural_policy import NeuralPolicy, Decision
 from .public_observation import PublicObservationAdapter
@@ -120,7 +121,7 @@ class NeuralTrainer:
         self._opponent_pool = replacement
         return copy.deepcopy(self._pool_import)
 
-    def _rollout(self, policy, episode_seed, learner_side, *, training):
+    def _rollout(self, policy, episode_seed, learner_side, *, training, behavior_diagnostics=False):
         if snapshot_manifest(self.snapshot, allow_real=self.allow_real) != self.manifest:
             raise ValueError("snapshot changed")
         start = time.perf_counter()
@@ -142,6 +143,7 @@ class NeuralTrainer:
             frozen_rng = np.random.default_rng(derived_seed(self.seed, episode_seed, learner_side, "frozen-opponent-v1"))
         trajectory, entropies, counts = [], [], []
         decisions = 0
+        behavior = EpisodeBehaviorDiagnostics() if behavior_diagnostics else None
         while not status["terminated"] and not status["truncated"]:
             side = status["current_actor"]
             candidates = (public_episode.candidate_views(side)
@@ -173,6 +175,8 @@ class NeuralTrainer:
                     action = opponent_rng.choice(candidates)
             if side == learner_side and self.observation_schema in (2, 3, 4):
                 action = action["action"]
+            if behavior is not None and side == learner_side:
+                behavior.observe_decision(observation, action)
             status = episode.step(action, side=side)
             if not status["terminated"] and any(status["rewards"].values()):
                 raise ValueError("episode violated terminal-only reward contract")
@@ -197,9 +201,11 @@ class NeuralTrainer:
             record["opponent_kind"] = entry["kind"]
             record["opponent_id"] = entry.get("sha256", "uniform")
             record["opponent_side"] = SIDES[1 - SIDES.index(learner_side)]
+        if behavior is not None:
+            record["behavior_diagnostics"] = behavior.report()
         return record, trajectory
 
-    def train(self, episodes=20, *, diagnostics=False):
+    def train(self, episodes=20, *, diagnostics=False, behavior_diagnostics=False):
         _positive_int("episodes", episodes, True)
         if episodes > 10000:
             raise ValueError("episodes exceeds per-call safety bound")
@@ -216,7 +222,8 @@ class NeuralTrainer:
             ppo_rng = (copy.deepcopy(self.policy.rng.bit_generator.state)
                        if self.policy.config.get("update_mode") == "ppo_clip" else None)
             record, trajectory = self._rollout(self.policy, self.train_seed_start + index,
-                                               SIDES[index % 2], training=True)
+                                               SIDES[index % 2], training=True, **(
+                                                   {"behavior_diagnostics": True} if behavior_diagnostics else {}))
             self.episodes_attempted += 1
             if record["own_score"] is not None:
                 self.episodes_completed += 1
@@ -403,6 +410,7 @@ def main(argv=None):
     parser.add_argument("--baseline-offset", choices=("none", "prior_batch_mean", "public_own_score"), default=None,
                         help="opt-in historical mean or current public own-score baseline; resume inherits saved mode")
     parser.add_argument("--training-diagnostics", action="store_true")
+    parser.add_argument("--behavior-diagnostics", action="store_true")
     parser.add_argument("--update-mode", choices=("reinforce", "ppo_clip"), default=None)
     parser.add_argument("--projection-backend", choices=("numpy", "scipy_csr"), default=None)
     parser.add_argument("--scoring", dest="scoring_mode", choices=("verified", "platform"),
@@ -445,7 +453,8 @@ def main(argv=None):
         if args.projection_backend is not None and args.projection_backend != trainer.policy.config.get("projection_backend", "numpy"):
             raise ValueError("requested projection backend differs from resumed checkpoint")
         start = time.perf_counter()
-        records = trainer.train(args.episodes, **({"diagnostics": True} if args.training_diagnostics else {}))
+        records = trainer.train(args.episodes, **({"diagnostics": True} if args.training_diagnostics else {}),
+                                **({"behavior_diagnostics": True} if args.behavior_diagnostics else {}))
         evaluation = trainer.evaluate()
         trainer.save(args.checkpoint)
         resources = {"elapsed_seconds": time.perf_counter() - start}
@@ -463,6 +472,7 @@ def main(argv=None):
                   "training": records, "training_summary": summary(records), "evaluation": evaluation,
                   "episodes_attempted": trainer.episodes_attempted, "episodes_completed": trainer.episodes_completed,
                   "updates": trainer.updates, "pending_completed_episodes": len(trainer.pending), "resources": resources}
+        report["behavior_diagnostics_enabled"] = args.behavior_diagnostics
         with args.report.open("x", encoding="utf-8") as stream:
             json.dump(report, stream, indent=2, sort_keys=True, allow_nan=False)
             stream.write("\n")

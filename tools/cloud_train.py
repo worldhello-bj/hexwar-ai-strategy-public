@@ -127,6 +127,7 @@ def parser():
     p.add_argument('--baseline-offset', choices=['none', 'prior_batch_mean', 'public_own_score'],
                    default='prior_batch_mean')
     p.add_argument('--training-diagnostics', action='store_true')
+    p.add_argument('--behavior-diagnostics', action='store_true')
     p.add_argument('--update-mode', choices=['reinforce', 'ppo_clip'], default='ppo_clip')
     p.add_argument('--observation-schema', type=int, choices=[2, 3, 4], default=2)
     p.add_argument('--projection-backend', choices=['numpy', 'scipy_csr'], default='numpy')
@@ -299,6 +300,8 @@ def _run_locked(args, run_id, output, trainer_class, replay_exporter):
         if (manifest['source'] != source or manifest['config'] != config or
                 manifest.get('checkpoint_format', 'json') != args.checkpoint_format):
             raise ValueError('incompatible source or training configuration; start a new run')
+        if manifest.get('behavior_diagnostics_enabled', False) != args.behavior_diagnostics:
+            raise ValueError('behavior diagnostics flag differs; start a new run')
         trainer = trainer_class.load(checkpoint_path, args.snapshot, allow_real=True)
         actual_pool = getattr(trainer, "opponent_pool_manifest", None)
         if ((actual_pool['config'] if actual_pool else None) != config.get('opponent_pool') or
@@ -321,7 +324,8 @@ def _run_locked(args, run_id, output, trainer_class, replay_exporter):
         directory.mkdir(exist_ok=False)
         manifest = {'schema_version': 1, 'run_id': run_id, 'commit': git_commit(), 'source': source,
                     'snapshot': trainer.manifest, 'config': config, 'offline_only': True,
-                    'backend': args.projection_backend + '_cpu', 'threads': 1}
+                    'backend': args.projection_backend + '_cpu', 'threads': 1,
+                    'behavior_diagnostics_enabled': args.behavior_diagnostics}
         if getattr(trainer, "opponent_pool_manifest", None) is not None:
             manifest['opponent_pool'] = trainer.opponent_pool_manifest
         if args.checkpoint_format != 'json':
@@ -379,7 +383,8 @@ def _run_locked(args, run_id, output, trainer_class, replay_exporter):
         progress('training')
         while trainer.episodes_attempted < args.episodes and not should_stop():
             tick = time.monotonic()
-            records.extend(trainer.train(1, **({"diagnostics": True} if args.training_diagnostics else {})))
+            records.extend(trainer.train(1, **({"diagnostics": True} if args.training_diagnostics else {}),
+                                         **({"behavior_diagnostics": True} if args.behavior_diagnostics else {})))
             training_elapsed += time.monotonic() - tick
             if trainer.episodes_attempted % args.checkpoint_every == 0:
                 save()
