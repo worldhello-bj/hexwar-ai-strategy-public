@@ -30,11 +30,31 @@ def _read_raw(name):
     return open(p, "rb").read() if os.path.exists(p) else b""
 
 
+def _read_user_fields():
+    """取官方 `User_Get.asp` 的字段串（客户端据此拿 列/行 等）。
+
+    ★ 本地完整采集（`snapshot/raw/`）**不入库**，公开克隆里没有；
+      所以必须回退到随仓库发布的 `offline/mock/User_Get.asp`
+      （同一份真实响应的桩，字段 6/7 就是 100×18）。
+      否则 `base_fields` 只剩一个空串，客户端拿不到行列数、端到端校验会崩。
+    """
+    for p in (os.path.join(RAW, "User_Get.asp.txt"),
+              os.path.join(RAW, "User_Get.asp"),
+              os.path.join(HERE, "mock", "User_Get.asp")):
+        if os.path.exists(p):
+            return open(p, "rb").read().decode("gb18030", errors="replace").strip(), p
+    return "", None
+
+
 class Bridge:
     def __init__(self):
         self.g = Game()
-        self.user_fields = (_read_raw("User_Get.asp.txt").decode("gb18030", errors="replace").strip())
+        self.user_fields, self.user_fields_src = _read_user_fields()
         self.base_fields = self.user_fields.split("$")
+        if len(self.base_fields) < 35:
+            raise RuntimeError(
+                "User_Get 字段串不可用（只有 %d 段）：请确认 offline/mock/User_Get.asp 存在"
+                % len(self.base_fields))
         self.gamecolor = "NONE"
         self.pending = []          # 待下发指令
         self.com_log = []

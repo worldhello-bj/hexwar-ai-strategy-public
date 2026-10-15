@@ -55,11 +55,16 @@ README = """# 想定 7527 · 城市攻防作战（2V2）—— 地图与编成
 | 文件 | 规模 | 字段 |
 |---|---|---|
 | `map_hexes.json` | {hexes} 格 | `elevation` 高程(m) / `cond` 地形 / `step` 通行等级 / `note` 道路 / `hex` 贴图索引 |
-| `units.json` | {units} 个单位 | `name`/`army` 编制、`typeid`（1 人员 2 车辆 3 空中 4 工事）、`data` 装备、`pos` 开局格、`blood` 兵力、`score` 权重分值 |
+| `units.json` | {units} 个单位 | `name`/`army` 编制、`typeid`（1 人员 2 车辆 3 空中 4 工事）、`data` 装备、`pos` 开局格、`blood` 兵力、`sons` 车内单位数（开局恒为 0）、`score` 权重分值 |
 | `cities.json` | {cities} 个夺控点 | `name` 主要/次要、`pos` 所在格 |
 
 行列数 {cols}×{rows}；红蓝各 {half} 个单位。`units.json` 已对齐**平台真实开局**
-（`RoomStart.asp` 之后的 `Obj_Get.asp`），不是抓包时的中局状态。
+（`RoomStart.asp` 之后的 `Obj_Get.asp`），不是抓包时的中局状态：
+
+* 36 个实体**全部在场**：`blood>0` 且 `pos>0`（没有谁被写成"已上车"）；
+* 载具的 `sons`（车内单位数）**一律为 0** —— 开局乘员以独立实体停在载具同格，
+  上车后 `sons` 才等于车内人数（中局才出现 1/4 这类值）；
+* 全部 `pos` 都落在地图格内，`data`/`wz` 都能在装备表里查到。
 
 ## 数据来源与获取方式
 
@@ -91,6 +96,7 @@ README = """# 想定 7527 · 城市攻防作战（2V2）—— 地图与编成
 ```bash
 py -3.13 tools/selftest_engine.py          # 读本目录跑引擎自检
 HEXWAR_SNAP=scenario/7527 py -3.13 tools/hex_score_audit.py   # 计分对账
+py -3.13 tools/verify_scenario_units.py    # 初设 36 单位：一手证据对账 + 不变式
 py -3.13 tools/publish_scenario.py --check # 本目录与本地采集是否一致
 ```
 
@@ -116,22 +122,32 @@ def scan(text, rel):
 
 
 def build():
-    if not os.path.isdir(SRC):
-        print("找不到 %s（本地采集目录）" % SRC)
-        return 1
+    """把本地采集里的白名单文件抽到 `scenario/7527/`，并生成 README + manifest。
+
+    ★ 两道入口都保留：
+      * 有本地采集（`snapshot/parsed/`）→ 从采集复制（首次发布 / 采集更新后重发）；
+      * 采集不在（封存或公开克隆）→ **就地刷新** `scenario/7527/` 里的现有文件
+        （只重扫敏感词、重算 sha1、重写 README/manifest），不报错。
+        否则 `sons` 这类原地修正之后，manifest 会永远对不上。
+    """
+    have_src = os.path.isdir(SRC)
     os.makedirs(DST, exist_ok=True)
+    if not have_src:
+        print("提示：本地采集目录 %s 不存在 → 就地刷新 scenario/7527/ 的清单" % SRC)
     files = {}
     problems = []
     for name in WHITELIST:
         src = os.path.join(SRC, name)
+        dst = os.path.join(DST, name)
         if not os.path.exists(src):
-            print("缺少来源文件 %s" % name)
-            return 1
+            if not os.path.exists(dst):
+                print("!! 缺少来源文件 %s（采集与已发布副本都没有）" % name)
+                return 1
+            src = dst                      # 就地刷新：以已发布副本为准
         text = io.open(src, encoding="utf-8").read()
         problems += scan(text, name)
-        dst = os.path.join(DST, name)
         io.open(dst, "w", encoding="utf-8").write(text)
-        files[name] = {"sha1": sha1(src), "bytes": os.path.getsize(src)}
+        files[name] = {"sha1": sha1(dst), "bytes": os.path.getsize(dst)}
     if problems:
         print("!! 发布前扫描命中，已中止（不生成 scenario/）：")
         for p in problems:
@@ -142,10 +158,12 @@ def build():
     units = json.load(io.open(os.path.join(DST, "units.json"), encoding="utf-8"))
     cities = json.load(io.open(os.path.join(DST, "cities.json"), encoding="utf-8"))
     us = b""
-    for cand in ("User_Get.asp.txt", "User_Get.asp"):
-        p = os.path.join(ROOT, "snapshot", "raw", cand)
-        if os.path.exists(p):
-            us = io.open(p, "rb").read()
+    # 本地完整采集优先；不在时退回随仓库发布的桩（同一份真实响应，字段 6/7 = 列/行）
+    for cand in (os.path.join(ROOT, "snapshot", "raw", "User_Get.asp.txt"),
+                 os.path.join(ROOT, "snapshot", "raw", "User_Get.asp"),
+                 os.path.join(ROOT, "offline", "mock", "User_Get.asp")):
+        if os.path.exists(cand):
+            us = io.open(cand, "rb").read()
             break
     cols = rows = "?"
     if us:
@@ -173,6 +191,12 @@ def build():
                           "City_Get.asp"],
             "note": "公开练习服抓取后解析；units.json 已对齐 RoomStart 后的真实开局",
         },
+        "opening_state": {
+            "evidence": ["2p_before_start.json", "2p_after_start.json"],
+            "asserts": ["36 单位全部在场（blood>0 且 pos>0）",
+                        "载具 sons 一律为 0（开局乘员与载具同格、独立成 entity）"],
+            "check": "py -3.13 tools/verify_scenario_units.py",
+        },
         "counts": {"hexes": len(hexes), "units": len(units), "cities": len(cities),
                    "grid": "%sx%s" % (cols, rows), "colors": colors},
         "files": dict(sorted(files.items())),
@@ -185,7 +209,7 @@ def build():
             "session.pkl 与 *_logged_in.html（本地会话/账号身份）",
             "raw/（原始响应，含响应头）",
             "manual_tables*.json / manual_grid.json（比赛手册的表格衍生物）",
-            "units.har.json（HAR 中局版本）",
+            "units.har.json（HAR 中局版本）与 snapshot/parsed/（本地完整采集目录）",
         ],
     }
     io.open(os.path.join(DST, "manifest.json"), "w", encoding="utf-8").write(

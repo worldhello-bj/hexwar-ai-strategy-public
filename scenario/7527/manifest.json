@@ -1,7 +1,7 @@
 {
  "scenario_id": 7527,
  "name": "城市攻防作战（2V2）",
- "published_at": "2026-10-15 23:41:20",
+ "published_at": "2026-10-16 00:10:51",
  "source": {
   "practice": "http://www.hexwar.cn/WARGAMEAI/",
   "compete": "http://43.143.209.228/WARGAMEAI",
@@ -13,6 +13,17 @@
    "City_Get.asp"
   ],
   "note": "公开练习服抓取后解析；units.json 已对齐 RoomStart 后的真实开局"
+ },
+ "opening_state": {
+  "evidence": [
+   "2p_before_start.json",
+   "2p_after_start.json"
+  ],
+  "asserts": [
+   "36 单位全部在场（blood>0 且 pos>0）",
+   "载具 sons 一律为 0（开局乘员与载具同格、独立成 entity）"
+  ],
+  "check": "py -3.13 tools/verify_scenario_units.py"
  },
  "counts": {
   "hexes": 2721,
@@ -34,8 +45,8 @@
    "bytes": 365083
   },
   "units.json": {
-   "sha1": "a227869e5cc23c50fc648e435a0b73e781ac8b28",
-   "bytes": 47154
+   "sha1": "d444314d407e93a718f5f67e6e7c0f9f59943e01",
+   "bytes": 47156
   }
  },
  "sensitive_scan": {
@@ -43,7 +54,7 @@
    "Cookie 头",
    "会话 ID",
    "账号字段",
-   "本机账号名",
+   "账号名",
    "签名"
   ],
   "hits": [],
@@ -53,6 +64,6 @@
   "session.pkl 与 *_logged_in.html（本地会话/账号身份）",
   "raw/（原始响应，含响应头）",
   "manual_tables*.json / manual_grid.json（比赛手册的表格衍生物）",
-  "units.har.json（HAR 中局版本）"
+  "units.har.json（HAR 中局版本）与 snapshot/parsed/（本地完整采集目录）"
  ]
 }

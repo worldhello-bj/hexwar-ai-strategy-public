@@ -8,11 +8,16 @@
 | 文件 | 规模 | 字段 |
 |---|---|---|
 | `map_hexes.json` | 2721 格 | `elevation` 高程(m) / `cond` 地形 / `step` 通行等级 / `note` 道路 / `hex` 贴图索引 |
-| `units.json` | 36 个单位 | `name`/`army` 编制、`typeid`（1 人员 2 车辆 3 空中 4 工事）、`data` 装备、`pos` 开局格、`blood` 兵力、`score` 权重分值 |
+| `units.json` | 36 个单位 | `name`/`army` 编制、`typeid`（1 人员 2 车辆 3 空中 4 工事）、`data` 装备、`pos` 开局格、`blood` 兵力、`sons` 车内单位数（开局恒为 0）、`score` 权重分值 |
 | `cities.json` | 3 个夺控点 | `name` 主要/次要、`pos` 所在格 |
 
 行列数 100×18；红蓝各 18 个单位。`units.json` 已对齐**平台真实开局**
-（`RoomStart.asp` 之后的 `Obj_Get.asp`），不是抓包时的中局状态。
+（`RoomStart.asp` 之后的 `Obj_Get.asp`），不是抓包时的中局状态：
+
+* 36 个实体**全部在场**：`blood>0` 且 `pos>0`（没有谁被写成"已上车"）；
+* 载具的 `sons`（车内单位数）**一律为 0** —— 开局乘员以独立实体停在载具同格，
+  上车后 `sons` 才等于车内人数（中局才出现 1/4 这类值）；
+* 全部 `pos` 都落在地图格内，`data`/`wz` 都能在装备表里查到。
 
 ## 数据来源与获取方式
 
@@ -44,6 +49,7 @@
 ```bash
 py -3.13 tools/selftest_engine.py          # 读本目录跑引擎自检
 HEXWAR_SNAP=scenario/7527 py -3.13 tools/hex_score_audit.py   # 计分对账
+py -3.13 tools/verify_scenario_units.py    # 初设 36 单位：一手证据对账 + 不变式
 py -3.13 tools/publish_scenario.py --check # 本目录与本地采集是否一致
 ```
 
