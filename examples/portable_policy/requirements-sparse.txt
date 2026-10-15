@@ -1,0 +1,3 @@
+# Optional CPU sparse backend; default NumPy backend needs no SciPy dependency.
+-r requirements-neural.txt
+scipy==1.17.0
