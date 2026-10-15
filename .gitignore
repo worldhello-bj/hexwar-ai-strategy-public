@@ -70,3 +70,6 @@ venv/
 .vscode/
 Thumbs.db
 Desktop.ini
+
+# Cloud experiment artifacts (checkpoints/replays are delivered separately)
+runs/

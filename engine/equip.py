@@ -53,7 +53,8 @@ EQUIPMENT = {
 }
 
 # 机动基础速度（秒/格），依据 typeid：1 徒步、2 车辆、3 空中
-BASE_STEP_SEC = {1: 60.0, 2: 12.0, 3: 6.0, 4: 999.0}
+# Type 4 is a fixed fortification, not a very slow mobile unit.
+BASE_STEP_SEC = {1: 60.0, 2: 12.0, 3: 6.0}
 
 # 地形对机动的影响系数（cond / 备注 归一到地形类别）
 TERRAIN_FACTOR = {

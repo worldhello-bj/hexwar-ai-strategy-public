@@ -22,28 +22,30 @@ from env.episode_api import TwoPlayerEpisode
 from env.match_eval import SIDES, _positive_int, snapshot_manifest
 from env.neural_train import NeuralTrainer, canonical, derived_seed
 from env.public_observation import PublicObservationAdapter
+from env.spatial_observation import SpatialObservationAdapter
 
 
-def export_replay(checkpoint, snapshot, *, seed, learner_side):
+def export_replay(checkpoint, snapshot, *, seed, learner_side, allow_real=False):
     _positive_int("seed", seed, True)
     if learner_side not in SIDES:
         raise ValueError("learner_side must be BLUE or RED")
     checkpoint = Path(checkpoint)
     source = checkpoint.read_bytes()
-    trainer = NeuralTrainer.load(checkpoint, snapshot)
+    trainer = NeuralTrainer.load(checkpoint, snapshot, allow_real=allow_real)
     frozen = canonical(trainer.checkpoint())
     episode = TwoPlayerEpisode(snapshot, **trainer.episode_config)
-    view = PublicObservationAdapter(episode) if trainer.observation_schema == 2 else episode
+    adapter = {2: PublicObservationAdapter, 3: SpatialObservationAdapter}.get(trainer.observation_schema)
+    view = adapter(episode) if adapter else episode
     status = episode.reset(seed=seed)
     opponent_rng = random.Random(derived_seed(trainer.seed, seed, learner_side, "opponent"))
     eval_rng = np.random.default_rng(derived_seed(trainer.seed, seed, learner_side, "evaluation"))
-    decisions, review_points = [], []
+    decisions, review_points, observed_steps = [], [], []
     initial_observation = view.observe(learner_side)
     previous_score = initial_observation.get("score")
     while not status["terminated"] and not status["truncated"]:
         side = status["current_actor"]
         candidates = (view.candidate_views(side)
-                      if side == learner_side and trainer.observation_schema == 2
+                      if side == learner_side and trainer.observation_schema in (2, 3)
                       else episode.legal_actions(side))
         if not candidates:
             status = {**status, "terminated": False, "truncated": True,
@@ -54,7 +56,7 @@ def export_replay(checkpoint, snapshot, *, seed, learner_side):
             probabilities = trainer.policy.probabilities(observation, candidates)
             selected = int(eval_rng.choice(len(candidates), p=probabilities))
             original_actions = ([candidate["action"] for candidate in candidates]
-                                if trainer.observation_schema == 2 else candidates)
+                                if trainer.observation_schema in (2, 3) else candidates)
             action = original_actions[selected]
             decisions.append(copy.deepcopy({
                 "decision_index": len(decisions), "step": status["steps"],
@@ -62,7 +64,7 @@ def export_replay(checkpoint, snapshot, *, seed, learner_side):
                 "candidates": [{"index": i, "action": original_actions[i],
                                 "probability": float(p),
                                 **({"public_context": candidates[i]["public_context"]}
-                                   if trainer.observation_schema == 2 else {})}
+                                   if trainer.observation_schema in (2, 3) else {})}
                                for i, p in enumerate(probabilities)],
                 "selected_index": selected, "selected_action": action,
                 "selected_probability": float(probabilities[selected]),
@@ -72,6 +74,11 @@ def export_replay(checkpoint, snapshot, *, seed, learner_side):
         status = episode.step(action, side=side)
         # Observe only the learner seat, even following an opponent action.
         after = view.observe(learner_side)
+        observed_steps.append(copy.deepcopy({
+            "after_step": status["steps"], "actor_is_learner": side == learner_side,
+            "learner_decision_index": len(decisions) - 1 if side == learner_side else None,
+            "observation": after,
+        }))
         score = after.get("score")
         if score is not None and score != previous_score:
             review_points.append({"kind": "public_score_change", "after_step": status["steps"],
@@ -92,9 +99,9 @@ def export_replay(checkpoint, snapshot, *, seed, learner_side):
         raise RuntimeError("replay mutated loaded parameters, optimizer, RNG or counters")
     if checkpoint.read_bytes() != source:
         raise RuntimeError("source checkpoint changed during replay")
-    if snapshot_manifest(snapshot) != trainer.manifest:
-        raise RuntimeError("synthetic snapshot changed during replay")
-    report = {"schema_version": 1, "replay_type": "frozen_learned_policy_vs_uniform_random",
+    if snapshot_manifest(snapshot, allow_real=allow_real) != trainer.manifest:
+        raise RuntimeError("snapshot changed during replay")
+    report = {"schema_version": 2, "replay_type": "frozen_learned_policy_vs_uniform_random",
             "seed": seed, "learner_side": learner_side,
             "source_checkpoint_sha256": hashlib.sha256(source).hexdigest(),
             "snapshot_sha256": trainer.manifest["sha256"],
@@ -103,15 +110,17 @@ def export_replay(checkpoint, snapshot, *, seed, learner_side):
             "policy_config": trainer.policy.config,
             "training_episodes_completed": trainer.episodes_completed,
             "initial_observation": initial_observation, "decisions": decisions,
+            "observed_steps": observed_steps,
             "review_points": review_points, "final_observation": final_observation,
             "ending": ending, "models_and_source_checkpoint_unchanged": True,
             "caveat": "One sampled trajectory of the learned stochastic policy, not a complete strategy table, a win claim, or preset tactics. Review markers show observed changes only; they do not identify causes. Opponent actions and private state are not exported. Truncation is not a scored result."}
 
 
-    if trainer.observation_schema == 2:
+    if trainer.observation_schema in (2, 3):
         report["public_board"] = copy.deepcopy(initial_observation["board"])
         for observation in [initial_observation, final_observation,
-                            *[d["observation"] for d in decisions]]:
+                            *[d["observation"] for d in decisions],
+                            *[s["observation"] for s in observed_steps]]:
             if observation.pop("board") != report["public_board"]:
                 raise RuntimeError("static public board changed during replay")
             observation["board_ref"] = "#/public_board"
@@ -177,6 +186,7 @@ def main(argv=None):
     parser.add_argument("--snapshot", required=True, type=Path)
     parser.add_argument("--seed", required=True, type=int)
     parser.add_argument("--learner-side", required=True, choices=SIDES)
+    parser.add_argument("--allow-real-map", action="store_true", help="opt in to an offline real snapshot")
     parser.add_argument("--report", required=True, type=Path)
     parser.add_argument("--csv", required=True, type=Path)
     parser.add_argument("--markdown", type=Path, help="optional concise selected-decision table")
@@ -185,7 +195,8 @@ def main(argv=None):
     if any(path.exists() for path in outputs) or len({p.resolve() for p in outputs}) != len(outputs):
         parser.error("choose distinct new JSON and CSV paths; existing files are never overwritten")
     try:
-        report = export_replay(args.checkpoint, args.snapshot, seed=args.seed, learner_side=args.learner_side)
+        report = export_replay(args.checkpoint, args.snapshot, seed=args.seed, learner_side=args.learner_side,
+                               allow_real=args.allow_real_map)
         with args.report.open("x", encoding="utf-8") as stream:
             json.dump(report, stream, indent=2, sort_keys=True, allow_nan=False)
             stream.write("\n")

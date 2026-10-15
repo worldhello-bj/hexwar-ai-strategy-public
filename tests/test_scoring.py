@@ -144,6 +144,59 @@ class ScoringTests(unittest.TestCase):
         self.assertIn("carried_unlinked", both["RED"]["unverified"])
         self.assertEqual(both["RED"]["remaining"], 40)      # 只剩 5×2 + 10×3
 
+    def test_explicit_missing_carrier_never_rebinds_by_stale_position(self):
+        self.unit("squad").detail["carrier"] = "missing"
+        both, issues = self.sides()
+        self.assertEqual(both["RED"]["remaining"], 40)
+        self.assertIn("squad", issues["carried_unlinked"])
+
+    def test_ambiguous_carried_identity_is_not_invented(self):
+        build(self.root, extra_carrier=True)
+        units = json.loads((self.root / "units.json").read_text())
+        for entry in units:
+            if entry["id"] == "truck2":
+                entry["son"] = "PLA2-191"
+                entry["color"] = "BLUE"
+        (self.root / "units.json").write_text(json.dumps(units))
+        game = Game(seed=1, snapshot=str(self.root))
+        self.assertNotIn("carrier", game.units["squad"].detail)
+        both, issues = self.sides(game)
+        self.assertTrue(issues["carried_ambiguous"])
+        self.assertEqual(both["RED"]["remaining"], 40)
+        self.assertEqual(both["BLUE"]["remaining"], 42)
+        for side in scoring.SIDES:
+            self.assertIn("carried_ambiguous", both[side]["unverified"])
+            self.assertEqual(scoring.side_score(game, side), both[side])
+
+    def test_icon_evidence_is_consumed_once_across_passengers(self):
+        build(self.root, extra_carrier=True)
+        units = json.loads((self.root / "units.json").read_text())
+        squad = next(entry for entry in units if entry["id"] == "squad")
+        units.append(dict(squad, id="squad2"))
+        (self.root / "units.json").write_text(json.dumps(units))
+        game = Game(seed=1, snapshot=str(self.root))
+        self.assertEqual(game.units["squad"].detail["carrier"], "truck")
+        self.assertNotIn("carrier", game.units["squad2"].detail)
+        self.assertTrue(game.carried_ambiguous)
+        game.link_carried()
+        self.assertNotIn("carrier", game.units["squad2"].detail)
+        self.assertEqual(game.units["truck"].detail["carried"], ["squad"])
+
+    def test_side_score_includes_unattributed_global_issues(self):
+        self.unit("squad").detail["carrier"] = "missing"
+        self.unit("squad").pos2 = FAR_HEX
+        both, _ = self.sides()
+        for side in scoring.SIDES:
+            self.assertEqual(scoring.side_score(self.game, side), both[side])
+
+    def test_verified_components_are_actually_filtered(self):
+        from unittest.mock import patch
+        self.unit("red").blood = 1
+        with patch.object(scoring, "VERIFIED_COMPONENTS", ("remaining",)):
+            both, _ = self.sides()
+        self.assertEqual(both["BLUE"]["verified"], 12)
+        self.assertEqual(both["BLUE"]["total"], 17)
+
     # ---------- 未知型号 / 编制来源 ----------
 
     def test_carried_points_die_with_carrier(self):
@@ -292,21 +345,32 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(env.score()["own"]["remaining"], before)   # 分值不变
         self.assertNotIn("aboard_damage_forgotten", env.score()["unverified"])
 
-    def test_load_damaged_unit_is_flagged_and_unload_restores_establishment(self):
-        """带伤上车 → 显式告警（平台“车内不记伤”未经直接实测）；下车按编制回满。"""
+    def test_damaged_load_roundtrip_preserves_remaining_and_killed(self):
         units = json.loads((self.root / "units.json").read_text())
         for entry in units:
             if entry["id"] == "squad":
-                entry.update(color="RED", pos=CARRIER_HEX, blood=1)   # 带伤
+                entry.update(color="RED", pos=CARRIER_HEX, blood=3)
                 entry.pop("pos2", None)
         (self.root / "units.json").write_text(json.dumps(units))
         env = self.make(side="RED")
+        env.game.units["squad"].blood = 1
+        before = env.score()
+        for action in ({"type": "load", "unit": "squad", "carrier": "truck"},
+                       {"type": "unload", "unit": "truck"}):
+            _, _, _, info = env.step(action)
+            self.assertFalse(info.get("invalid_action"), info)
+            after = env.score()
+            self.assertEqual(after["own"]["remaining"], before["own"]["remaining"])
+            self.assertEqual(after["enemy"]["killed"], before["enemy"]["killed"])
+            self.assertIn("damaged_transport_unverified", after["unverified"])
+        self.assertEqual(env.game.units["squad"].blood, 1)
+        self.assertEqual(env.game.units["squad"].establishment, 3)
+        self.assertNotIn("carrier", env.game.units["squad"].detail)
         env.step({"type": "load", "unit": "squad", "carrier": "truck"})
-        self.assertIn("aboard_damage_forgotten", env.score()["unverified"])
-        env.step({"type": "unload", "unit": "truck"})
-        squad = env.game.units["squad"]
-        self.assertEqual(squad.blood, 3)                     # 按编制回满
-        self.assertNotIn("carrier", squad.detail)
+        env.game.units["truck"].blood = 0
+        after = env.score()
+        self.assertEqual(after["own"]["remaining"], 10)
+        self.assertEqual(after["enemy"]["killed"], 39)
 
     def test_loaded_unit_dies_with_carrier_after_engine_load(self):
         """引擎自己的 `load` 也要跟平台一致：车毁 ⇒ 乘员一并被歼（分扣除并记给对手）。"""

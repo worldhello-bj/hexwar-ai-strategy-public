@@ -16,6 +16,7 @@ from env.match_eval import SIDES, _positive_int, snapshot_manifest
 from env.neural_policy import NeuralPolicy
 from env.neural_train import NeuralTrainer, canonical, derived_seed
 from env.public_observation import PublicObservationAdapter
+from env.spatial_observation import SpatialObservationAdapter
 
 
 def state_hash(policy):
@@ -38,7 +39,7 @@ class FrozenSampler:
 
 def run_game(snapshot, policies, schemas, config, *, seed, a_side):
     episode = TwoPlayerEpisode(snapshot, **config)
-    public = PublicObservationAdapter(episode)
+    public = {2: PublicObservationAdapter(episode), 3: SpatialObservationAdapter(episode)}
     seats = {side: "A" if side == a_side else "B" for side in SIDES}
     samplers = {side: FrozenSampler(policies[seats[side]], derived_seed("frozen_match", seed, side, seats[side]))
                 for side in SIDES}
@@ -47,8 +48,8 @@ def run_game(snapshot, policies, schemas, config, *, seed, a_side):
     while not status["terminated"] and not status["truncated"]:
         side = status["current_actor"]
         schema = schemas[seats[side]]
-        observation = (public if schema == 2 else episode).observe(side)
-        candidates = public.candidate_views(side) if schema == 2 else episode.legal_actions(side)
+        observation = (public[schema] if schema in (2, 3) else episode).observe(side)
+        candidates = public[schema].candidate_views(side) if schema in (2, 3) else episode.legal_actions(side)
         if not candidates:
             status = {**status, "truncated": True, "reason": "no_legal_actions", "winner": None,
                       "final_scores": None, "rewards": {s: 0 for s in SIDES}}
@@ -56,7 +57,7 @@ def run_game(snapshot, policies, schemas, config, *, seed, a_side):
         choice = samplers[side](observation, candidates)
         if canonical(choice) not in {canonical(candidate) for candidate in candidates}:
             raise RuntimeError("sampler returned unadvertised action")
-        action = choice["action"] if schema == 2 else choice
+        action = choice["action"] if schema in (2, 3) else choice
         trace_hash.update(canonical([side, observation, candidates, action]).encode())
         status = episode.step(action, side=side)
         if not status["terminated"] and any(status["rewards"].values()):

@@ -20,6 +20,7 @@ from .episode_api import TwoPlayerEpisode
 from .match_eval import SIDES, _positive_int, snapshot_manifest
 from .neural_policy import NeuralPolicy, Decision
 from .public_observation import PublicObservationAdapter
+from .spatial_observation import SpatialObservationAdapter
 
 
 def canonical(value):
@@ -69,14 +70,15 @@ class NeuralTrainer:
             raise ValueError("reserve 1 to 256 unique heldout seeds")
         for value in self.heldout_seeds:
             _positive_int("heldout seed", value, True)
-        if isinstance(observation_schema, bool) or not isinstance(observation_schema, int) or observation_schema not in (1, 2):
-            raise ValueError("observation_schema must be 1 or 2")
+        if isinstance(observation_schema, bool) or not isinstance(observation_schema, int) or observation_schema not in (1, 2, 3):
+            raise ValueError("observation_schema must be 1, 2 or 3")
         self.observation_schema = observation_schema
         self.policy_config = copy.deepcopy(policy_config or {})
-        representation = "public_v2_split" if observation_schema == 2 else "legacy_json"
+        representation = {1: "legacy_json", 2: "public_v2_split",
+                          3: "public_v3_spatial"}[observation_schema]
         if self.policy_config.get("representation", representation) != representation:
             raise ValueError("policy representation does not match observation schema")
-        if observation_schema == 2:
+        if observation_schema in (2, 3):
             self.policy_config["representation"] = representation
         self.policy = NeuralPolicy(seed=seed, **self.policy_config)
         self.initial_policy = copy.deepcopy(self.policy.checkpoint())
@@ -90,7 +92,8 @@ class NeuralTrainer:
             raise ValueError("snapshot changed")
         start = time.perf_counter()
         episode = TwoPlayerEpisode(self.snapshot, **self.episode_config)
-        public_episode = PublicObservationAdapter(episode) if self.observation_schema == 2 else episode
+        adapter = {2: PublicObservationAdapter, 3: SpatialObservationAdapter}.get(self.observation_schema)
+        public_episode = adapter(episode) if adapter else episode
         status = episode.reset(seed=episode_seed)
         opponent_rng = random.Random(derived_seed(self.seed, episode_seed, learner_side, "opponent"))
         eval_rng = np.random.default_rng(derived_seed(self.seed, episode_seed, learner_side, "evaluation"))
@@ -99,7 +102,7 @@ class NeuralTrainer:
         while not status["terminated"] and not status["truncated"]:
             side = status["current_actor"]
             candidates = (public_episode.candidate_views(side)
-                          if side == learner_side and self.observation_schema == 2
+                          if side == learner_side and self.observation_schema in (2, 3)
                           else episode.legal_actions(side))
             if not candidates:
                 status = {**status, "terminated": False, "truncated": True,
@@ -108,19 +111,20 @@ class NeuralTrainer:
                 break
             if side == learner_side:
                 observation = public_episode.observe(side)
-                probs = policy.probabilities(observation, candidates)
+                if training:
+                    action, decision, probs = policy.sample(
+                        observation, candidates, return_probabilities=True)
+                    trajectory.append(decision)
+                else:
+                    probs = policy.probabilities(observation, candidates)
+                    action = candidates[int(eval_rng.choice(len(candidates), p=probs))]
                 entropies.append(float(-np.sum(probs * np.log(np.maximum(probs, 1e-300)))))
                 counts.append(len(candidates))
                 decisions += 1
-                if training:
-                    action, decision = policy.sample(observation, candidates)
-                    trajectory.append(decision)
-                else:
-                    action = candidates[int(eval_rng.choice(len(candidates), p=probs))]
             else:
                 # No opposing observation is ever fetched or supplied to learner.
                 action = opponent_rng.choice(candidates)
-            if side == learner_side and self.observation_schema == 2:
+            if side == learner_side and self.observation_schema in (2, 3):
                 action = action["action"]
             status = episode.step(action, side=side)
             if not status["terminated"] and any(status["rewards"].values()):
@@ -204,7 +208,7 @@ class NeuralTrainer:
 
     def checkpoint(self):
         return copy.deepcopy({"schema_version": 1, "algorithm": self.algorithm,
-            **({"observation_schema": 2} if self.observation_schema == 2 else {}),
+            **({"observation_schema": self.observation_schema} if self.observation_schema in (2, 3) else {}),
             # 计分口径绑定：口径一变，旧检查点的"原始终局分"就不可比，
             # 混用两套奖励会污染训练，所以载入时必须逐步校验。
             "scoring_version": scoring.SCORING_VERSION,
@@ -232,6 +236,8 @@ class NeuralTrainer:
             raise ValueError(
                 "checkpoint scoring version %r does not match %r; retrain or convert"
                 % (data.get("scoring_version"), scoring.SCORING_VERSION))
+        if data["episode_config"].get("scoring_mode", "verified") != data.get("scoring_mode", "verified"):
+            raise ValueError("checkpoint episode scoring mode differs")
         trainer = cls(snapshot, observation_schema=data.get("observation_schema", 1), allow_real=allow_real,
                       scoring_mode=data.get("scoring_mode", "verified"),
                       **{k: data[k] for k in ("seed", "train_seed_start", "batch_episodes",
@@ -295,13 +301,14 @@ def main(argv=None):
     parser.add_argument("--buckets", type=int, default=2048)
     parser.add_argument("--hidden-dim", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=0.001)
-    parser.add_argument("--observation-schema", type=int, choices=(1, 2), default=None,
-                        help="2 opts into public map/dynamic/candidate split; resume inherits saved schema")
+    parser.add_argument("--observation-schema", type=int, choices=(1, 2, 3), default=None,
+                        help="2: public split; 3: public split plus objective geometry; resume inherits saved schema")
     parser.add_argument("--baseline-offset", choices=("none", "prior_batch_mean"), default=None,
                         help="opt-in prior completed-batch score mean; resume inherits saved mode")
     parser.add_argument("--update-mode", choices=("reinforce", "ppo_clip"), default=None)
+    parser.add_argument("--projection-backend", choices=("numpy", "scipy_csr"), default=None)
     parser.add_argument("--scoring", dest="scoring_mode", choices=("verified", "platform"),
-                        default="verified",
+                        default=None,
                         help="reward scope: verified = only confirmed components (default); "
                              "platform = use the platform-style three-component sum")
     parser.add_argument("--ppo-clip", type=float, default=None)
@@ -322,13 +329,13 @@ def main(argv=None):
                                     allow_real=args.allow_real_map) if args.resume else NeuralTrainer(
             args.snapshot, observation_schema=args.observation_schema or 1, seed=args.seed, train_seed_start=args.train_seed_start, batch_episodes=args.batch_episodes,
             heldout_seeds=args.eval_seeds, episode_config=episode_config,
-            allow_real=args.allow_real_map, scoring_mode=args.scoring_mode,
+            allow_real=args.allow_real_map, scoring_mode=args.scoring_mode or "verified",
             policy_config={"buckets": args.buckets, "hidden_dim": args.hidden_dim, "learning_rate": args.learning_rate,
                            **({"baseline_offset": args.baseline_offset} if args.baseline_offset is not None else {}),
-                           **{k: getattr(args, k) for k in ("update_mode", "ppo_clip", "update_epochs") if getattr(args, k) is not None}})
+                           **{k: getattr(args, k) for k in ("update_mode", "ppo_clip", "update_epochs", "projection_backend") if getattr(args, k) is not None}})
         if args.observation_schema is not None and args.observation_schema != trainer.observation_schema:
             raise ValueError("requested observation schema differs from resumed checkpoint")
-        if args.scoring_mode != trainer.scoring_mode:
+        if args.scoring_mode is not None and args.scoring_mode != trainer.scoring_mode:
             raise ValueError("requested scoring mode differs from resumed checkpoint")
         if (args.baseline_offset is not None and
                 args.baseline_offset != trainer.policy.config.get("baseline_offset", "none")):
@@ -337,6 +344,8 @@ def main(argv=None):
             requested = getattr(args, key)
             if requested is not None and requested != trainer.policy.config.get(key, "reinforce" if key == "update_mode" else None):
                 raise ValueError("requested " + key + " differs from resumed checkpoint")
+        if args.projection_backend is not None and args.projection_backend != trainer.policy.config.get("projection_backend", "numpy"):
+            raise ValueError("requested projection backend differs from resumed checkpoint")
         start = time.perf_counter()
         records = trainer.train(args.episodes)
         evaluation = trainer.evaluate()

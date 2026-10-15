@@ -42,7 +42,9 @@ from . import equip
 # 以免旧模型与新公式混用（同一快照下两套奖励会污染训练）。
 # v6：上车/下车语义也按实测对齐——上车 `blood=0`（编制留在 establishment，计分不变）、
 #     下车按**编制**回满；于是车毁时乘员随车被歼的扣除与平台一致。
-SCORING_VERSION = 6
+# v7: stable transport identity, verified filtering, and damage-conserving transport.
+# v8: immobile fortifications cannot move or capture; invalidate older training contracts.
+SCORING_VERSION = 8
 
 # ---------------- 载员编制兵力 ----------------
 # 表本身在**装备层**（`engine/equip.py`）：引擎自己（下车、发射巡飞弹）也要用它，
@@ -111,6 +113,7 @@ def breakdown(game):
                 host = candidate
             else:
                 issues["carried_unlinked"].append(u.id)      # 关联指向已消失/无阵营的载具
+                continue  # An explicit stable ID must never be rebound by stale position.
         if host is None:
             # 回退：老数据没有稳定关联，只在该格能唯一确定归属时使用。
             group = [m for m in game.units.values()
@@ -122,8 +125,7 @@ def breakdown(game):
                     issues["carried_ambiguous"].append((u.id, sorted(str(m.id) for m in pool)))
                 elif u.id not in issues["carried_unlinked"]:
                     issues["carried_unlinked"].append(u.id)
-                if not pool:
-                    continue
+                continue
             host = sorted(pool, key=lambda x: str(x.id))[0]
         if carried_establishment(u.data) is None:
             issues["carried_establishment_unknown"].append((u.id, u.data))
@@ -143,13 +145,13 @@ def _from_parts(parts, issues, side, cities=()):
     #  ② **真用 ObjInto 装进车里**的乘员：车被歼时它**连带被歼**，其 `score × 编制` 从剩余兵力分里
     #     扣除、并记给对手（`loadkill_20261015-223027`：354 → **298** = 车 40 + 乘员 4×4=16，
     #     且之后 `Obj2_Out` 返回 `0` —— 放不出来了）。
-    #     ⇒ 所以这里只在**载具存活**时把车内载员按编制计入。
+    #     ⇒ 载具存活才计入车内兵力；v7 中途装车保留实际血量，快照缺失时取编制。
     remaining = sum(u.score * u.blood for u in mine["deployed"])
     for carried, host in mine["carried"]:
-        establishment = carried_establishment(carried.data)
-        if establishment is None or not host.alive():
+        strength = carried.detail.get("aboard_blood", carried_establishment(carried.data))
+        if strength is None or not host.alive():
             continue                       # 未知型号 / 载具已毁（乘员随之被歼）：不计入
-        remaining += carried.score * establishment
+        remaining += carried.score * strength
 
     # ---- 歼灭分（★ 已实测：Σ(损失兵力 × score)，与剩余兵力分逐点互补）----
     # 车里的人随车一起算：载具被歼 ⇒ 车体的 `score × 编制` **加上**其载员的 `score × 编制`
@@ -157,9 +159,12 @@ def _from_parts(parts, issues, side, cities=()):
     killed = sum(u.score * max(0, u.establishment - u.blood)
                  for u in other["deployed"])
     for carried, host in other["carried"]:
-        establishment = carried_establishment(carried.data)
-        if establishment is not None and not host.alive():
-            killed += carried.score * establishment
+        establishment = (carried.establishment if "aboard_blood" in carried.detail
+                         else carried_establishment(carried.data))
+        strength = carried.detail.get("aboard_blood", establishment)
+        if establishment is not None and strength is not None:
+            lost = establishment - strength if host.alive() else establishment
+            killed += carried.score * max(0, lost)
 
     # ---- 夺控分（★ 已实测：主要 +80 / 次要 +50，一次性）----
     captured = 0
@@ -188,6 +193,9 @@ def _from_parts(parts, issues, side, cities=()):
     if any(u.detail.get("aboard_damage_forgotten") for u in mine["deployed"] + [c for c, _h in mine["carried"]]):
         # 带伤上车：平台模型是“车内不记伤、下车按编制回满”，但这一条**没有直接实测**。
         unverified.append("aboard_damage_forgotten")
+    if any(u.detail.get("damaged_transport_unverified")
+           for u in mine["deployed"] + [c for c, _h in mine["carried"]]):
+        unverified.append("damaged_transport_unverified")
     if any(u.detail.get("carrier") for u in mine["deployed"]):
         # 理论上不该发生：上车后 blood 会被置 0，于是它应当落在 `carried` 而不是 `deployed`。
         # 真出现了（外部构造的状态/旧测试）就报出来，避免惄惄地按“上阵单位”算。
@@ -195,8 +203,10 @@ def _from_parts(parts, issues, side, cities=()):
     for city in cities:
         if city.get("flag") == side and capture_point_value(city.get("name")) is None:
             unverified.append("capture_point_name_unknown")
-    return {"remaining": remaining, "captured": captured, "killed": killed,
-            "total": remaining + captured + killed, "verified": remaining + captured + killed,
+    components = {"remaining": remaining, "captured": captured, "killed": killed}
+    return {**components,
+            "total": sum(components.values()),
+            "verified": sum(components[name] for name in VERIFIED_COMPONENTS),
             "unverified": sorted(set(unverified))}
 
 
@@ -214,8 +224,8 @@ def _global_unverified(issues):
 
 def side_score(game, side):
     """一方三个分项 + `total`/`verified`/`unverified`。"""
-    parts, issues = breakdown(game)
-    return _from_parts(parts, issues, side, getattr(game, "cities", ()))
+    scores, _issues = both_scores(game)
+    return scores[side]
 
 
 def both_scores(game):

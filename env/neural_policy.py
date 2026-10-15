@@ -42,7 +42,8 @@ class Decision:
 class NeuralPolicy:
     def __init__(self, *, seed=0, buckets=2048, hidden_dim=32,
                  learning_rate=0.001, gradient_clip=5.0, hash_seed=0, representation="legacy_json",
-                 baseline_offset="none", update_mode="reinforce", ppo_clip=None, update_epochs=None):
+                 baseline_offset="none", update_mode="reinforce", ppo_clip=None, update_epochs=None,
+                 projection_backend="numpy"):
         for name, value in (("buckets", buckets), ("hidden_dim", hidden_dim)):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(name + " must be a positive integer")
@@ -52,7 +53,7 @@ class NeuralPolicy:
         self.config = dict(seed=seed, buckets=buckets, hidden_dim=hidden_dim,
                            learning_rate=learning_rate, gradient_clip=gradient_clip,
                            hash_seed=hash_seed)
-        if representation not in ("legacy_json", "public_v2_split"):
+        if representation not in ("legacy_json", "public_v2_split", "public_v3_spatial"):
             raise ValueError("unsupported policy representation")
         # Omit the legacy default to preserve the original checkpoint format.
         if representation != "legacy_json":
@@ -74,9 +75,15 @@ class NeuralPolicy:
             if isinstance(update_epochs, bool) or not isinstance(update_epochs, int) or not 1 <= update_epochs <= 100:
                 raise ValueError("update_epochs must be an integer between 1 and 100")
             self.config.update(update_mode=update_mode, ppo_clip=ppo_clip, update_epochs=update_epochs)
+        if projection_backend not in ("numpy", "scipy_csr"):
+            raise ValueError("unsupported projection backend")
+        if projection_backend == "scipy_csr":
+            from scipy.sparse import csr_matrix
+            self._csr_matrix = csr_matrix
+            self.config["projection_backend"] = projection_backend
         self.return_mean = 0.0
         self.return_count = 0
-        self.feature_width = buckets * (2 if representation == "public_v2_split" else 1)
+        self.feature_width = buckets * (2 if representation in ("public_v2_split", "public_v3_spatial") else 1)
         self.rng = np.random.default_rng(seed)
         self.params = {"observation": self.rng.normal(0, 0.05, (self.feature_width, hidden_dim)),
                        "action": self.rng.normal(0, 0.05, (self.feature_width, hidden_dim)),
@@ -91,12 +98,28 @@ class NeuralPolicy:
 
     def _features(self, value):
         accumulated = {}
+        # Only hash identities, never feature amounts or mutable observations.
+        # Tuple paths serialize byte-for-byte like the previous list paths.
+        config_key = json.dumps([self.config["hash_seed"], self.config["buckets"]],
+                                ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+        if config_key != getattr(self, "_feature_hash_config", None):
+            self._feature_hash_cache = {}
+            self._feature_hash_config = config_key
+        cache = self._feature_hash_cache
         def emit(path, kind, token=None, amount=1.0):
-            identity = json.dumps([self.config["hash_seed"], path, kind, token],
-                                  ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-            digest = hashlib.blake2b(identity.encode(), digest_size=16).digest()
-            index = int.from_bytes(digest[:8], "little") % self.config["buckets"]
-            sign = 1.0 if digest[8] & 1 else -1.0
+            key = (path, kind, token)
+            cached = cache.get(key)
+            if cached is None:
+                identity = json.dumps([self.config["hash_seed"], path, kind, token],
+                                      ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+                digest = hashlib.blake2b(identity.encode(), digest_size=16).digest()
+                index = int.from_bytes(digest[:8], "little") % self.config["buckets"]
+                sign = 1.0 if digest[8] & 1 else -1.0
+                if len(cache) >= 32768:
+                    cache.clear()
+                cache[key] = (index, sign)
+            else:
+                index, sign = cached
             accumulated[index] = accumulated.get(index, 0.0) + sign * amount
         def visit(item, path):
             if item is None:
@@ -115,14 +138,14 @@ class NeuralPolicy:
                     raise ValueError("JSON object keys must be strings")
                 emit(path, "object")
                 for key in sorted(item):
-                    visit(item[key], path + [["key", key]])
+                    visit(item[key], path + (("key", key),))
             elif isinstance(item, list):
                 emit(path, "array")
                 for index, child in enumerate(item):
-                    visit(child, path + [["index", index]])
+                    visit(child, path + (("index", index),))
             else:
                 raise ValueError("features require JSON values")
-        visit(value, [])
+        visit(value, ())
         # Generic input norm controls saturation without altering returns.
         keys = np.array(sorted(accumulated), dtype=np.int64)
         values = np.array([accumulated[k] for k in keys], dtype=np.float64)
@@ -137,8 +160,19 @@ class NeuralPolicy:
         result[indices] = values
         return result
 
-    @staticmethod
-    def _project(features, weight, bias):
+    def _sparse_features(self, features, width):
+        sizes = [len(indices) for indices, _ in features]
+        indptr = np.concatenate(([0], np.cumsum(sizes, dtype=np.int64)))
+        indices = np.concatenate([x[0] for x in features])
+        values = np.concatenate([x[1] for x in features])
+        return self._csr_matrix((values, indices, indptr), shape=(len(features), width))
+
+    def _project(self, features, weight, bias):
+        if self.config.get("projection_backend") == "scipy_csr":
+            # No nnz-by-hidden gather/product temporary. Bias addition changes
+            # floating accumulation order slightly; the backend is opt-in and
+            # explicitly checkpointed for reproducible resume.
+            return np.tanh(self._sparse_features(features, weight.shape[0]) @ weight + bias)
         # One batched sparse projection for all candidate actions.
         sizes = [len(indices) for indices, _ in features]
         rows = np.repeat(np.arange(len(features)), sizes)
@@ -184,11 +218,15 @@ class NeuralPolicy:
     def _decision(self, observation, candidates, selected=0):
         if not candidates:
             raise ValueError("policy needs at least one supplied candidate")
-        if self.config.get("representation", "legacy_json") == "public_v2_split":
-            if not isinstance(observation, dict) or observation.get("schema_version") != 2 or "board" not in observation:
-                raise ValueError("public_v2_split requires a schema-v2 public observation")
+        representation = self.config.get("representation", "legacy_json")
+        if representation in ("public_v2_split", "public_v3_spatial"):
+            schema = 2 if representation == "public_v2_split" else 3
+            if not isinstance(observation, dict) or observation.get("schema_version") != schema or "board" not in observation:
+                raise ValueError(f"{representation} requires a schema-v{schema} public observation")
             if any(not isinstance(a, dict) or set(a) != {"action", "public_context"} for a in candidates):
-                raise ValueError("public_v2_split requires public candidate views")
+                raise ValueError(f"{representation} requires public candidate views")
+            if schema == 3 and any("objective_relations" not in a["public_context"] for a in candidates):
+                raise ValueError("public_v3_spatial requires public objective relations")
             dynamic = {k: v for k, v in observation.items() if k != "board"}
             return Decision(self._split_features(dynamic, observation["board"], cache_second=True),
                             tuple(self._split_features(a["action"], a["public_context"]) for a in candidates), selected)
@@ -197,11 +235,12 @@ class NeuralPolicy:
     def probabilities(self, observation, candidates):
         return self._forward(self._decision(observation, candidates))[3]
 
-    def sample(self, observation, candidates):
+    def sample(self, observation, candidates, *, return_probabilities=False):
         record = self._decision(observation, candidates)
         probs = self._forward(record)[3]
         index = int(self.rng.choice(len(candidates), p=probs))
-        return candidates[index], Decision(record.observation, record.candidates, index)
+        result = (candidates[index], Decision(record.observation, record.candidates, index))
+        return (*result, probs) if return_probabilities else result
 
     def select(self, observation, candidates):
         return self.sample(observation, candidates)[0]
@@ -227,16 +266,19 @@ class NeuralPolicy:
         # These residual targets are internal critic targets, not changed returns.
         if baseline_offset != 0.0:
             examples = [(d, score - baseline_offset) for d, score in examples]
-        forward = [self._forward(d) for d, _ in examples]
-        if advantages is None:
-            advantages = [score - f[4] for (_, score), f in zip(examples, forward)]
+        # Stream activations: retaining every candidate matrix for the whole
+        # batch can consume gigabytes on the competition map. Parameters remain
+        # unchanged until this method returns, so implicit advantages stay frozen.
+        if advantages is not None and len(advantages) != count:
+            raise ValueError("advantages must match examples")
         if old_log_probs is not None:
-            if len(old_log_probs) != count or len(advantages) != count or not np.isfinite(old_log_probs).all() or not np.isfinite(advantages).all():
+            if len(old_log_probs) != count or not np.isfinite(old_log_probs).all() or (advantages is not None and not np.isfinite(advantages).all()):
                 raise ValueError("invalid frozen PPO batch")
         loss = 0.0
         h = self.config["hidden_dim"]
-        for i, ((decision, score), adv, f) in enumerate(zip(examples, advantages, forward)):
-            obs, actions, joint, probs, value, log_probs = f
+        for i, (decision, score) in enumerate(examples):
+            obs, actions, joint, probs, value, log_probs = self._forward(decision)
+            adv = score - value if advantages is None else advantages[i]
             actor_weight = adv
             if old_log_probs is None:
                 loss += -adv * log_probs[decision.selected] / actor_normalizer + 0.5 * (value - score) ** 2 / count
@@ -277,8 +319,12 @@ class NeuralPolicy:
             np.add.at(gradients["observation"], indices, values[:, None] * dobs)
             gradients["observation_bias"] += dobs
             gradients["action_bias"] += dactions.sum(axis=0)
-            for (indices, values), derivative in zip(decision.candidates, dactions):
-                np.add.at(gradients["action"], indices, values[:, None] * derivative)
+            if self.config.get("projection_backend") == "scipy_csr":
+                gradients["action"] += self._sparse_features(
+                    decision.candidates, self.feature_width).T @ dactions
+            else:
+                for (indices, values), derivative in zip(decision.candidates, dactions):
+                    np.add.at(gradients["action"], indices, values[:, None] * derivative)
         return float(loss), gradients
 
     def update_batch(self, trajectories):

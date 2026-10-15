@@ -309,7 +309,7 @@ class HexwarEnv:
                 acts.append({"type": "stop_attack", "unit": u.id})
             # 夺控
             for c in g.cities:
-                if c["pos"] == u.pos and c.get("flag") != self.side:
+                if g.capture_eligible(u) and c["pos"] == u.pos and c.get("flag") != self.side:
                     acts.append({"type": "capture", "unit": u.id})
             # 隐蔽切换（手册 4.5(2)：打击间隔期间不允许掩蔽）
             if not self._in_attack_gap(u):
@@ -417,7 +417,11 @@ class HexwarEnv:
             raise ValueError("unit must be a living own unit")
         if u.detail.get("carrier") or u.stunned(g.second):
             raise ValueError("unit cannot act in its current state")
+        if kind == "capture" and not g.capture_eligible(u):
+            raise ValueError("unit cannot capture objectives")
         if kind == "move":
+            if not u.is_mobile():
+                raise ValueError("unit is immobile")
             path = act.get("path")
             if not isinstance(path, (list, tuple)) or not path:
                 raise ValueError("move path must be nonempty")
@@ -631,18 +635,14 @@ class HexwarEnv:
                     "msg": "被压制不能上/下车（手册 4.6.3(1)）", "seconds": 0}
             if self._seat_left(car) <= 0:
                 return None, 0.0, False, {"msg": "载员已满", "seconds": 0}
-            # ★ 平台实测（`docs/运输机制实测.md` + `tools/hex_load_kill_probe.py`）：
-            #   上车后该单位变成 `blood=0 / color=''`（车内读不到兵力与阵营），**编制留在 establishment**，
-            #   平台按编制把它计入剩余兵力分；下车时**新建实体、blood = 编制、color = 载具那方**。
-            #   所以这里也要清 color：否则 `scoring.breakdown` 会把它当成“上阵单位”按 0 血计分。
-            establishment = (scoring.carried_establishment(u.data) or u.establishment or u.blood)
+            # Hide onboard strength as in snapshots, but retain observed blood
+            # separately. Damaged embarkation healing has not been measured;
+            # inventing full health here creates free remaining/kill reward.
             if scoring.carried_establishment(u.data) is None:
                 u.detail["establishment_unverified"] = True
-            if u.blood != establishment:
-                # 带伤上车：平台模型是“车内不记伤”，下车按编制回满。
-                # 这一条**没有直接实测**，所以显式报出（`aboard_damage_forgotten`）。
-                u.detail["aboard_damage_forgotten"] = True
-            u.establishment = establishment
+            if u.blood != u.establishment:
+                u.detail["damaged_transport_unverified"] = True
+            u.detail["aboard_blood"] = u.blood
             u.blood = 0
             u.color = ""
             u.detail["carrier"] = car.id
@@ -663,12 +663,12 @@ class HexwarEnv:
                 # （见 `docs/运输机制实测.md`）；不恢复的话，这个单位会一直“像载员”
                 # ——没有阵营就不进剩余兵力分，分值直接凭空消失。
                 p.color = u.color
-                establishment = scoring.carried_establishment(p.data) or p.establishment or p.blood
+                establishment = p.establishment or scoring.carried_establishment(p.data) or p.blood
                 if scoring.carried_establishment(p.data) is None:
-                    # 编制未知：不臆造，显式标记并让 `scoring` 报出（不静默算分）。
                     p.detail["establishment_unverified"] = True
-                # ★ 平台实测：下车 = 新建实体，其 `blood` 就是**编制**（跟车内期间/之前的伤无关）。
-                p.blood = establishment
+                # Fresh snapshots lack observed onboard strength; only those
+                # use establishment. An in-game load/unload must conserve blood.
+                p.blood = p.detail.pop("aboard_blood", establishment)
                 p.establishment = establishment
                 p.units = max(1, p.blood) if p.typeid in (1, 2) else 1
                 p.pos = u.pos

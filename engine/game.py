@@ -16,7 +16,7 @@ from . import geometry as G
 from . import crt
 from . import paths as _paths
 from .equip import (EQUIPMENT, WEAPONS, AMMO_FIELD, ANTI_AIR_CLASS, CRT_AIR_NAME,
-                    carried_establishment)
+                    carried_establishment, BASE_STEP_SEC)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SNAP = (os.environ.get("HEXWAR_SNAP")
@@ -90,6 +90,10 @@ class Unit:
             self.detail["son_icons"] = icons
 
     # --- 单位类别（手册 4.8 / 4.9 / 4.10）---
+    def is_mobile(self):
+        """Only personnel, vehicles and aircraft have a movement contract."""
+        return self.typeid in BASE_STEP_SEC
+
     def is_air(self):
         return self.typeid == 3
 
@@ -189,7 +193,7 @@ class Game:
         ② 该格唯一的车辆/飞行器（`typeid` 2/3）；
         ③ 该格唯一的单位。
 
-        ①②③ 都定不下去时按 `id` 排序取第一辆，并**显式记入 `self.carried_ambiguous`**；
+        ①②③ 都定不下去时不臆造归属，**显式记入 `self.carried_ambiguous`**；
         完全找不到归属的记入 `self.carried_unlinked` —— 两者都由 `engine.scoring`
         报出（不静默算分）。重复调用是安全的（已关联的不再处理）。
         """
@@ -200,18 +204,24 @@ class Game:
                    if not u.color and u.pos == 0 and u.blood == 0 and u.pos2
                    and not u.detail.get("carrier")]
         hosts = [u for u in self.units.values() if u.color]
+        icons_left = {h.id: list(h.detail.get("son_icons") or []) for h in hosts}
+        # Account for existing links too, so calling this method again cannot
+        # reuse the same icon evidence for a second passenger.
+        for linked in self.units.values():
+            remaining = icons_left.get(linked.detail.get("carrier"), [])
+            ico = linked.detail.get("ico")
+            if ico in remaining:
+                remaining.remove(ico)
         for u in sorted(pending, key=lambda x: str(x.id)):
             group = [h for h in hosts if h.pos == u.pos2]
-            icons_left = {h.id: list(h.detail.get("son_icons") or []) for h in group}
             ico = u.detail.get("ico")
             candidates = [h for h in group if ico and ico in icons_left[h.id]]
-            if len(candidates) > 1:
-                self.carried_ambiguous.append((u.id, [h.id for h in candidates]))
             if not candidates:
                 vehicles = [h for h in group if h.typeid in (2, 3)]
                 candidates = vehicles or group
-                if len(candidates) > 1:
-                    self.carried_ambiguous.append((u.id, [h.id for h in candidates]))
+            if len(candidates) > 1:
+                self.carried_ambiguous.append((u.id, sorted(str(h.id) for h in candidates)))
+                continue
             if not candidates:
                 self.carried_unlinked.append(u.id)
                 continue
@@ -280,6 +290,8 @@ class Game:
         u = self.units.get(unit_id)
         if not u:
             return False, "棋子不存在"
+        if not u.is_mobile() or not u.alive() or u.detail.get("carrier"):
+            return False, "单位不能独立移动"
         u.detail["path"] = [int(x) for x in path]
         u.detail["path_idx"] = 0
         return True, ""
@@ -428,14 +440,14 @@ class Game:
 
     def step_seconds(self, unit, from_id, to_id):
         """返回进入 to_id 一格所需秒数（客户端会 ×1000 作为动画时长）。"""
-        if not unit.alive() or unit.detail.get("carrier"):
+        if not unit.is_mobile() or not unit.alive() or unit.detail.get("carrier"):
             return 0, "单位不能独立移动"
         if not self.hex(from_id) or G.distance(from_id, to_id) != 1:
             return 0, "必须移动到相邻格"
         ok, why = self.passable(to_id, unit)
         if not ok:
             return 0, why
-        base = {1: 60.0, 2: 12.0, 3: 6.0, 4: 999.0}.get(unit.typeid, 60.0)
+        base = BASE_STEP_SEC[unit.typeid]
         terr = self.terrain_kind(to_id)
         # 手册 4.6.3(1)：人员被压制后不能机动；需等压制解除后才能继续（4.1.1(6)）。
         if unit.typeid in (1, 2) and unit.stunned(self.second):
@@ -636,15 +648,15 @@ class Game:
     def now_str(self):
         return time.strftime("%Y/%m/%d %H:%M:%S")
 
-    def apply_city_capture(self, unit):
-        """夺控：到达夺控点格且该格及相邻 6 格无敌方地面单位。
+    def capture_eligible(self, unit):
+        """Unit eligibility only; objective location and enemy contest are separate."""
+        return (unit.alive() and bool(unit.color) and not unit.detail.get("carrier")
+                and unit.blood >= CAPTURE_MIN_BLOOD and unit.typeid in (1, 2)
+                and not any(k in (unit.name or "") for k in self.NO_CAPTURE_HINT))
 
-        手册 4.3(2)：空中单位和炮兵不能执行夺控任务。
-        """
-        if (not unit.alive() or not unit.color or unit.detail.get("carrier")
-                or unit.blood < CAPTURE_MIN_BLOOD or unit.typeid == 3):
-            return None
-        if any(k in (unit.name or "") for k in self.NO_CAPTURE_HINT):
+    def apply_city_capture(self, unit):
+        """Only eligible ground units capture; aircraft, artillery and bunkers cannot."""
+        if not self.capture_eligible(unit):
             return None
         for c in self.cities:
             if c["pos"] != unit.pos:

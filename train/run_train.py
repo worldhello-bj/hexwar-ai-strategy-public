@@ -88,6 +88,7 @@ FLAGS = {
     "observation_schema": "--observation-schema",
     "baseline_offset": "--baseline-offset",
     "update_mode": "--update-mode",
+    "projection_backend": "--projection-backend",
     "ppo_clip": "--ppo-clip",
     "update_epochs": "--update-epochs",
     "checkpoint": "--checkpoint",
@@ -112,7 +113,7 @@ ALLOWED = {
             "seed", "train_seed_start", "eval_seeds", "batch_episodes", "max_seconds",
             "max_steps", "buckets", "hidden_dim", "learning_rate",
             "observation_schema", "baseline_offset", "update_mode", "scoring",
-            "ppo_clip", "update_epochs", "checkpoint", "resume", "report"),
+            "ppo_clip", "update_epochs", "projection_backend", "checkpoint", "resume", "report"),
     "eval": ("checkpoint", "snapshot", "seeds", "report", "allow_real_map"),
     "diff": ("snapshot", "radius", "steps"),
 }

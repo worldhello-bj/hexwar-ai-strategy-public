@@ -57,6 +57,34 @@ class NeuralTrainingTests(unittest.TestCase):
         self.assertEqual(NeuralTrainer.load(path, self.snapshot).checkpoint(),
                          trainer.checkpoint())
 
+    def test_inconsistent_checkpoint_scoring_mode_rejected(self):
+        path, trainer = self.checkpoint_file()
+        data = json.loads(path.read_text())
+        data["episode_config"]["scoring_mode"] = "platform"
+        path.write_text(json.dumps(data))
+        with self.assertRaisesRegex(ValueError, "episode scoring mode"):
+            NeuralTrainer.load(path, self.snapshot)
+
+    def test_cli_resume_inherits_platform_scoring_if_unspecified(self):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        trainer = self.trainer(scoring_mode="platform")
+        saved = self.root / "platform.json"
+        trainer.save(saved)
+        common = ["--snapshot", str(self.snapshot), "--resume", str(saved),
+                  "--episodes", "0", "--checkpoint", str(self.root / "next.json"),
+                  "--report", str(self.root / "report.json")]
+        with patch.object(NeuralTrainer, "train", return_value=[]), patch.object(
+                NeuralTrainer, "evaluate", return_value={"initial": {"summary": {}}, "trained": {"summary": {}}}), redirect_stdout(io.StringIO()):
+            self.assertEqual(main(common), 0)
+        data = json.loads((self.root / "next.json").read_text())
+        self.assertEqual(data["scoring_mode"], "platform")
+        common[common.index("--checkpoint") + 1] = str(self.root / "bad.json")
+        common[common.index("--report") + 1] = str(self.root / "bad-report.json")
+        with patch.object(NeuralTrainer, "train") as train, redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
+            main(common + ["--scoring", "verified"])
+        train.assert_not_called()
+
     def test_platform_scoring_mode_is_recorded_and_trains(self):
         trainer = self.trainer(scoring_mode="platform", batch_episodes=2)
         self.assertEqual(trainer.scoring_mode, "platform")
@@ -222,11 +250,11 @@ class PublicNeuralTrainingTests(NeuralTrainingTests):
         original_step = TwoPlayerEpisode.step
         selected, observations, batches = [], [], []
         original_update = trainer.policy.update_batch
-        def sample(obs, candidates):
+        def sample(obs, candidates, **kwargs):
             observations.append(copy.deepcopy(obs))
-            choice, record = original_sample(obs, candidates)
-            selected.append(choice["action"])
-            return choice, record
+            result = original_sample(obs, candidates, **kwargs)
+            selected.append(result[0]["action"])
+            return result
         def step(episode, action, **kwargs):
             self.assertNotIn("public_context", action)
             if selected:
@@ -281,7 +309,7 @@ class PublicNeuralTrainingTests(NeuralTrainingTests):
         trainer = self.trainer()
         self.assertEqual(trainer.checkpoint()["observation_schema"], 2)
         self.assertEqual(trainer.policy.config["representation"], "public_v2_split")
-        for schema in (True, 0, 3, 2.0):
+        for schema in (True, 0, 4, 2.0):
             with self.assertRaises(ValueError):
                 NeuralTrainer(self.snapshot, observation_schema=schema)
         with self.assertRaises(ValueError):

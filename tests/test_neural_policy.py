@@ -39,6 +39,20 @@ class NeuralPolicyTests(unittest.TestCase):
             p.select({}, [])
         self.assertIs(p.select({}, [actions[0]]), actions[0])
 
+    def test_sample_can_return_probabilities_without_duplicate_forward(self):
+        from unittest.mock import patch
+        p, q = self.model(seed=51), self.model(seed=51)
+        obs, candidates = {"s": 2}, [{"a": 1}, {"a": 2}]
+        expected_probs = q.probabilities(obs, candidates)
+        expected_action, expected_decision = q.sample(obs, candidates)
+        with patch.object(p, "_forward", wraps=p._forward) as forward:
+            action, decision, probs = p.sample(obs, candidates, return_probabilities=True)
+        self.assertEqual(forward.call_count, 1)
+        self.assertEqual(action, expected_action)
+        self.assertEqual(decision.to_dict(), expected_decision.to_dict())
+        np.testing.assert_array_equal(probs, expected_probs)
+        self.assertEqual(p.checkpoint(), q.checkpoint())
+
     def test_observation_action_product_changes_preferences(self):
         p = self.model()
         actions = [{"x": 1}, {"x": 2}]
@@ -132,7 +146,7 @@ class NeuralPolicyTests(unittest.TestCase):
         tree = ast.parse(source)
         imports = [n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)]
         imports += [alias.name for n in ast.walk(tree) if isinstance(n, ast.Import) for alias in n.names]
-        self.assertEqual(set(imports), {"dataclasses", "hashlib", "json", "math", "pathlib", "numpy"})
+        self.assertEqual(set(imports), {"dataclasses", "hashlib", "json", "math", "pathlib", "numpy", "scipy.sparse"})
         self.assertNotIn("getattr(env", source)
 
 

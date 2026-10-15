@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from env.episode_api import TwoPlayerEpisode
+from env.public_observation import PublicObservationAdapter
 from env.match_eval import write_synthetic_snapshot
 from env.neural_train import NeuralTrainer
 from tools.export_policy_replay import export_replay, write_csv, main, reconstruct_observation
@@ -30,6 +31,19 @@ class PolicyReplayTests(unittest.TestCase):
         path = self.root / f'checkpoint-{schema}-{public}-{seconds}-{steps}.json'
         trainer.save(path)
         return trainer, path
+
+    def test_competition_snapshot_requires_explicit_allow_real(self):
+        snapshot = Path(__file__).resolve().parents[1] / "scenario" / "7527"
+        trainer = NeuralTrainer(snapshot, allow_real=True, observation_schema=2,
+            policy_config={"buckets": 16, "hidden_dim": 4},
+            episode_config={"max_seconds": 0, "max_steps": 2})
+        path = self.root / "competition.json"
+        trainer.save(path)
+        with self.assertRaises(ValueError):
+            export_replay(path, snapshot, seed=100, learner_side="BLUE")
+        report = export_replay(path, snapshot, seed=100, learner_side="BLUE", allow_real=True)
+        self.assertTrue(report["models_and_source_checkpoint_unchanged"])
+        self.assertEqual(report["snapshot_sha256"], trainer.manifest["sha256"])
 
     def test_determinism_original_actions_and_same_evaluation_trajectory(self):
         for schema in (1, 2):
@@ -66,6 +80,26 @@ class PolicyReplayTests(unittest.TestCase):
                 self.assertEqual(captured, exported_steps)
                 self.assertEqual(expected['own_score'], report['ending']['own_original_score'])
                 self.assertEqual(expected['status']['seconds'], report['ending']['game_time'])
+
+    def test_every_step_records_only_learner_observation(self):
+        _, path = self.trainer()
+        original_observe = PublicObservationAdapter.observe
+        observed_sides = []
+        def observe(episode, side):
+            observed_sides.append(side)
+            return original_observe(episode, side)
+        with patch.object(PublicObservationAdapter, 'observe', observe):
+            report = export_replay(path, self.snapshot, seed=100, learner_side='BLUE')
+        self.assertEqual(set(observed_sides), {'BLUE'})
+        frames = report['observed_steps']
+        self.assertEqual([f['after_step'] for f in frames], list(range(1, report['ending']['steps'] + 1)))
+        self.assertEqual(frames[-1]['observation'], report['final_observation'])
+        for frame in frames:
+            self.assertNotIn('action', frame)
+            self.assertEqual(frame['observation']['side'], 'BLUE')
+            self.assertEqual(frame['observation']['board_ref'], '#/public_board')
+            if not frame['actor_is_learner']:
+                self.assertIsNone(frame['learner_decision_index'])
 
     def test_entire_checkpoint_parameters_rng_and_source_are_frozen(self):
         trainer, path = self.trainer()
