@@ -307,9 +307,52 @@ def main(argv=None):
     parser.add_argument("--ppo-clip", type=float, default=None)
     parser.add_argument("--update-epochs", type=int, default=None)
     parser.add_argument("--resume", type=Path)
+    parser.add_argument("--eval-only", action="store_true",
+                        help="只评测一个已存在的检查点：载入 --checkpoint，跑 --eval-seeds"
+                             "（省略则用检查点里预留的 heldout 种子），写 --report；不训练、不改检查点")
     parser.add_argument("--checkpoint", required=True, type=Path)
     parser.add_argument("--report", required=True, type=Path)
     args = parser.parse_args(argv)
+
+    def write_report(payload):
+        with args.report.open("x", encoding="utf-8") as stream:
+            json.dump(payload, stream, indent=2, sort_keys=True, allow_nan=False)
+            stream.write("\n")
+
+    if args.eval_only:
+        # ★ 只评测：PPO 检查点原先没有评测入口（env.policy_eval 只认 MC 表检查点），
+        #   文档里的 "train → eval" 流程因此走不通。这里补上，行为与训练末尾的
+        #   evaluation 完全一致（同一 evaluate()，同一 heldout 种子约定）。
+        if not args.checkpoint.exists():
+            parser.error("--eval-only 需要已存在的 --checkpoint")
+        if args.report.exists():
+            parser.error("--report 已存在：换个新路径")
+        try:
+            trainer = NeuralTrainer.load(args.checkpoint, args.snapshot,
+                                         allow_real=args.allow_real_map)
+            start = time.perf_counter()
+            evaluation = trainer.evaluate(list(args.eval_seeds) if args.eval_seeds else None)
+            report = {"algorithm": trainer.algorithm, "snapshot": trainer.manifest,
+                      "observation_schema": trainer.observation_schema,
+                      "scoring_mode": trainer.scoring_mode,
+                      "scoring_version": scoring.SCORING_VERSION,
+                      "episode_config": trainer.episode_config,
+                      "policy_config": trainer.policy_config,
+                      "eval_only": str(args.checkpoint),
+                      "training": [], "training_summary": summary([]),
+                      "evaluation": evaluation,
+                      "episodes_attempted": trainer.episodes_attempted,
+                      "episodes_completed": trainer.episodes_completed,
+                      "updates": trainer.updates,
+                      "resources": {"elapsed_seconds": time.perf_counter() - start}}
+            write_report(report)
+        except (ValueError, TypeError, KeyError, OSError) as exc:
+            parser.error(str(exc))
+        print(json.dumps({"evaluation": {k: evaluation[k]["summary"]
+                                         for k in ("initial", "trained")},
+                          "resources": report["resources"]}, sort_keys=True))
+        return 0
+
     if args.checkpoint.exists() or args.report.exists() or args.checkpoint.resolve() == args.report.resolve():
         parser.error("choose separate new checkpoint and report paths")
     try:

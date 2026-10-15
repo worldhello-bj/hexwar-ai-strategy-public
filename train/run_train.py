@@ -128,6 +128,29 @@ ALLOWED = {
 MODULE = {"mc": "env.selfplay", "ppo": "env.neural_train", "eval": "env.policy_eval",
           "run_episode": "env.run_episode", "diff": "tools.hex_env_diff"}
 
+MC_ALGO = "first_visit_terminal_mc"
+NEURAL_ALGOS = ("neural_terminal_reinforce_vs_random", "neural_terminal_ppo_clip_vs_random")
+
+
+def checkpoint_kind(path):
+    """检查点类型 → 用哪个评测器：'mc'（表）/ 'neural'（策略）/ None（不认识）。
+
+    两个加载器互不兼容（`env.policy_eval` → SelfPlayTrainer 只认 MC 表；
+    `env.neural_train` → NeuralTrainer 只认神经策略）。文档里的 "train → eval" 流程
+    在 PPO 检查点上曾直接报 `unsupported checkpoint`，所以这里先判类型再分流，
+    判不出来就报错，不隷。
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            algo = json.load(fh).get("algorithm")
+    except (OSError, ValueError):
+        return None
+    if algo == MC_ALGO:
+        return "mc"
+    if algo in NEURAL_ALGOS:
+        return "neural"
+    return None
+
 
 def core_root():
     """定位"核心"（engine/ env/ tools/ scenario/ 所在目录），两种布局都支持。
@@ -292,7 +315,30 @@ def main():
     if sub in ("mc", "ppo") and not (cfg.get("checkpoint") or "--checkpoint" in extra):
         raise SystemExit("%s 需要 checkpoint（或在配置里给 checkpoint）" % sub)
     argv = to_argv(cfg) + extra
-    cmd = py_module(MODULE[sub], argv)
+    if sub == "eval":
+        ck = cfg.get("checkpoint")
+        if ck is None and "--checkpoint" in extra:
+            ck = extra[extra.index("--checkpoint") + 1]
+        kind = checkpoint_kind(os.path.join(HERE, str(ck))) if ck else None
+        if kind is None:
+            raise SystemExit(
+                "eval 需要 --checkpoint，且只认两类：MC 表（algorithm=%s）或神经策略\n"
+                "（%s）。读不到或不认识的检查点不猜——先看该文件里的 algorithm 字段。"
+                % (MC_ALGO, " / ".join(NEURAL_ALGOS)))
+        if kind == "neural":
+            # 神经策略没有独立评测器：走 neural_train 的 --eval-only（同一 evaluate()）
+            argv = ["--eval-only", "--checkpoint", str(ck),
+                    "--snapshot", str(cfg.get("snapshot", DEFAULT_SCENARIO)),
+                    "--report", str(cfg.get("report", "analysis/eval.json"))]
+            if cfg.get("allow_real_map"):
+                argv.insert(1, "--allow-real-map")
+            if cfg.get("seeds"):
+                argv += ["--eval-seeds"] + [str(s) for s in cfg["seeds"]]
+            cmd = [PY, "-m", "env.neural_train"] + argv
+        else:
+            cmd = py_module(MODULE["eval"], argv)
+    else:
+        cmd = py_module(MODULE[sub], argv)
     ensure_dirs(cfg)
     if args.dry_run:
         print("$ " + " ".join(cmd))
