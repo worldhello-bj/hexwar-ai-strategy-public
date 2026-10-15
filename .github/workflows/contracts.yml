@@ -1,0 +1,30 @@
+name: Offline contract tests
+on:
+  pull_request:
+  push:
+    branches: [master]
+permissions:
+  contents: read
+jobs:
+  contracts:
+    runs-on: ubuntu-latest
+    env:
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+    timeout-minutes: 10
+    strategy:
+      matrix:
+        python-version: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install neural baseline dependency
+        run: python -m pip install -r requirements-neural.txt
+      - name: Unit contracts (synthetic fixtures only)
+        run: python -m unittest discover -s tests -v
+      - name: Existing rule regression
+        run: python tools/verify_rules.py
+      - name: Existing table consistency
+        run: python tools/verify_tables.py

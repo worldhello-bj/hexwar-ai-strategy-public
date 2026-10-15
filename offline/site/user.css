@@ -1,0 +1,252 @@
+/* 棋子标题文字 */
+#object div i {
+//font-size:20px;
+}
+
+/* 地图标注文字CSS代码 */
+#map div section.note {
+overflow:hidden;
+left:-71px;
+width:200px;
+font-family:'黑体' !important;
+font-size:20px;
+line-height:58px;
+font-weight:bold;
+color:#000;
+z-index:3;
+-webkit-text-shadow:#fff 1px 0 0,#fff 0 1px 0,#fff -1px 0 0,#fff 0 -1px 0;
+-moz-text-shadow:#fff 1px 0 0,#fff 0 1px 0,#fff -1px 0 0,#fff 0 -1px 0;
+text-shadow:#fff 1px 0 0,#fff 0 1px 0,#fff -1px 0 0,#fff 0 -1px 0;
+}
+
+/* 红方棋子顶部标题样式 */
+#object div[color='RED'] i {
+color:#ff0000;
+}
+
+/* 蓝方棋子顶部标题样式 */
+#object div[color='BLUE'] i {
+color:#0000ff;
+}
+
+/* 工事不显示血量 */
+#object div[army=''] b {
+display:none;
+}
+
+/* 棋子三维图标变小 */
+#object div img {
+//position:absolute;
+//top:15px;
+//left:15px;
+//width:50px;
+//height:50px;
+}
+
+/* 棋子军标样式 */
+#object.icon div img {
+//position:absolute;
+//top:10px;
+//left:10px;
+//width:60px;
+//height:60px;
+//margin:8px;
+//width:40px;
+//height:40px;
+}
+
+/* 军标加大一倍 */
+#object.icon div img {
+//left:-20px;
+//top:-21px;
+//width:120px;
+//height:120px;
+}
+
+#object.icon div i {
+display:none !important;
+}
+
+/* 算子模式 */
+#object.light div img {
+position:absolute;
+top:19px !important;
+left:18px !important;
+width:40px !important;
+height:40px !important;
+-moz-box-shadow: 0px 0px 2px #000;
+-webkit-box-shadow: 0px 0px 2px #000;
+box-shadow: 0px 0px 2px #000;
+border-radius:4px;
+}
+
+#object.light div[color='RED'] img {
+background:#ad1e1f;
+border:2px #cc7373 solid;
+border-top-color:#cc7373;
+border-left-color:#bd494a;
+border-right-color:#781516;
+border-bottom-color:#590f10;
+}
+
+#object.light div[color='BLUE'] img {
+background:#0068b7;
+border:2px #0068b7 solid;
+border-top-color:#4a94cc;
+border-left-color:#4a94cc;
+border-right-color:#004376;
+border-bottom-color:#004376;
+}
+
+#object.light div[color='GREEN'] img {
+background:#486a00;
+border:2px #486a00 solid;
+border-top-color:#8da260;
+border-left-color:#8da260;
+border-right-color:#324a00;
+border-bottom-color:#324a00;
+}
+
+#object.light div[typeid='4'] img,#object.light div[typeid='5'] img {
+margin:0;
+width:40px;
+height:40px;
+}
+
+#object.light div.sel img {
+border-color:#fff;
+}
+
+#object.light div i {
+display:inline-block !important;
+transform: translate(-50%, 0) scale(0.8,0.8);
+position:absolute;
+top:20px !important;
+left:40px !important;
+width:52px !important;
+text-align:center;
+text-shadow:none !important;
+color:#fff !important;
+font-family:'黑体';
+font-size:60% !important;
+white-space:nowrap; /* 不换行 */
+overflow:hidden;
+margin:0 !important;
+padding:0 !important;
+background:none !important;
+border:none !important;
+}
+
+/* 工事内棋子 */
+#object div img.son {
+top:10px;
+left:32px !important; /* 小人相对楼房的位置 */
+width:40px;
+height:40px;
+}
+
+#CommandForm select {
+margin:0 2px;
+}
+
+/* 编组队标 */
+#city div[flag='XZ'] img,#city div[flag='FZJ'] img,#city div[flag='PJP'] img,#city div[flag='ZA'] img,#city div[flag='WX'] img,#city div[flag='JXBZ'] img,#city div[flag='ZBBZ'] img {
+top:-40px;
+}
+
+/* 2026/3/8 */
+#city div[flag='DBT'] label {
+position:absolute;
+top:23px;
+left:-60px;
+width:200px;
+height:30px;
+line-height:30px;
+}
+
+#city div[flag='DBT'] label b {
+font-size:30px !important;
+}
+
+#city div[flag='DBT'] img {
+display:none;
+}
+
+@media only screen and (min-device-width: 320px) and (max-device-width: 1600px), (max-width: 1600px) {
+	#RoomClock,#Report {
+		width:160px;
+	}
+	#RoomClock b,#RoomTime b {
+		padding:0 5px;
+		font-size:12px;
+	}
+	#RoomTime {
+		left:180px;
+		transform: none;
+	}
+	#taskBtn .btn,#CommandForm .btn {
+		float:left;
+		margin:0 2px;
+		padding:0 4px;
+		height:26px;
+		line-height:24px;
+	}
+	#taskBtn select,#CommandForm select {
+		font-size:18px !important;
+		height:26px !important;
+		vertical-align:middle !important;
+	}
+}
+
+/* 工事建筑物不显示算子背景 */
+#body #object.light div[typeid='4'] img {
+-moz-box-shadow:none;
+-webkit-box-shadow:none;
+box-shadow:none;
+background:none;
+border:none;
+}
+
+/* 工事建筑物（小图标） */
+#body #object.light div[typeid='4'] img {
+top:10px !important;
+left:10px !important;
+width:60px !important;
+height:60px !important;
+}
+
+/* 工事建筑物（中图标） */
+#body #object.light div[typeid='4'][c1="1"] img {
+top:0px !important;
+left:0px !important;
+width:80px !important;
+height:80px !important;
+}
+
+/* 工事建筑物（大图标） */
+#body #object.light div[typeid='4'][c1="2"] img {
+top:-20px !important;
+left:-20px !important;
+width:120px !important;
+height:120px !important;
+}
+
+/* 算子模式标题加大 */
+#body #object.light div i {
+//top:-30px !important;
+//font-size:40px !important;
+//width:150px !important;
+//height:40px !important;
+//line-height:40px !important;
+//-webkit-text-shadow:#000 1px 0 0,#000 0 1px 0,#000 -1px 0 0,#000 0 -1px 0 !important;
+//-moz-text-shadow:#000 1px 0 0,#000 0 1px 0,#000 -1px 0 0,#000 0 -1px 0 !important;
+//text-shadow:#000 1px 0 0,#000 0 1px 0,#000 -1px 0 0,#000 0 -1px 0 !important;
+}
+
+/* 算子模式算子大小 */
+#body #object.light div img {
+//top:9px !important;
+//left:8px !important;
+//width:60px !important;
+//height:60px !important;
+}

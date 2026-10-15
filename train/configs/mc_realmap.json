@@ -1,0 +1,14 @@
+{
+ "note": "比赛初设 7527 自博弈基线（与 docs/真实地图训练.md 记录的 mc60 同参数，便于对比）",
+ "snapshot": "../scenario/7527",
+ "allow_real_map": true,
+ "episodes": 60,
+ "move_radius": 4,
+ "max_seconds": 1200,
+ "max_steps": 600,
+ "seed": 0,
+ "eval_seeds": [1000000, 1000001],
+ "scoring": "verified",
+ "checkpoint": "analysis/realmap/mc60.json",
+ "report": "analysis/realmap/mc60_report.json"
+}

@@ -1,0 +1,72 @@
+# ============================================================
+# 绝不公开：第三方版权资源 / 抓取数据 / 会话信息 / 手册
+# ============================================================
+
+# 抓包（含会话 Cookie 与认证头）
+*.har
+*.chlsj
+*.pcap
+
+# 官方前端镜像与其资源（版权归原厂商）——★ 2026-10-15 起**随仓库分发**
+#   （使用者在本次会话中明确确认公开，见 NOTICE「第三方材料」一节）
+#   offline/site/  offline/assets/  offline/mock/  offline/data.js
+offline/server_access.log
+
+# 抓取到的服务端数据与本地会话（含 Set-Cookie）
+snapshot/
+
+# ============================================================
+# 封存区（archive/exploration/）：脚本与过程文档入库，数据一律不入库
+#   —— capture/ 与 analysis/ 和 har/ 里有会话 Cookie、账号名、Set-Cookie 响应头
+# ============================================================
+archive/exploration/capture/
+archive/exploration/analysis/
+archive/exploration/har/
+archive/exploration/artifacts/
+
+# ============================================================
+# 已公开发布的比赛地图（scenario/7527/）**要入库** —— 见其 README 与
+# tools/publish_scenario.py（白名单发布 + 敏感扫描 + sha1 清单）
+# ============================================================
+
+# 训练环境 train/ 里由 tools/build_train_env.py 同步生成的副本（手工文件照常入库）
+train/engine/
+train/env/
+train/offline/
+train/tests/
+train/tools/
+train/docs/
+train/samples/
+train/analysis/
+train/snapshot
+train/MANIFEST.json
+train/requirements.txt
+
+# 实测采集产物：服务端下发的单位/地图快照，属服务端数据（结论见 docs/运输机制实测.md）
+7527_transport_capture/
+
+# 分析中间产物：手册文本/页面渲染、客户端函数摘录、HAR 报告
+analysis/
+
+# 手册原文：使用者明确要求随仓库分发（见 NOTICE 末节）
+# 注意：该 PDF 版权属原出版方；若本仓库转为**公开**需重新评估
+
+# 本机凭据
+.env
+.env.*
+secrets.*
+
+# ============================================================
+# 本机与临时
+# ============================================================
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.idea/
+*.log
+*.tmp
+*~
+.vscode/
+Thumbs.db
+Desktop.ini

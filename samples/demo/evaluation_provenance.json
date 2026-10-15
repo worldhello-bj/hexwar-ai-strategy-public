@@ -1,0 +1,6 @@
+{
+  "origin": "original_synthetic",
+  "generator": "tools/make_sample.py",
+  "purpose": "offline_synthetic_game_software_tests",
+  "note": "Original generated demo fixture, not a real scenario or external service snapshot. Existing game data and rules are unchanged."
+}

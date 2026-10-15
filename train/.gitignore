@@ -1,0 +1,21 @@
+# train/ 里**手工维护**的文件（README / run_train.py / configs / skill）才入库；
+# 下面这些是由主仓库 `tools/build_train_env.py` 同步生成的副本 —— 改了主仓库要重新同步：
+#     py -3.13 tools/build_train_env.py --check      # 看漂移
+#     py -3.13 tools/build_train_env.py              # 重新同步
+engine/
+env/
+offline/
+tests/
+tools/
+docs/
+scenario/
+
+# （不生成 samples/：训练环境不携带任何合成 demo 夹具）
+
+# 生成物与运行产物
+MANIFEST.json
+requirements.txt
+analysis/
+snapshot
+__pycache__/
+.pytest_cache/

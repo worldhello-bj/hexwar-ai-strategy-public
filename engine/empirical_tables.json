@@ -1,0 +1,113 @@
+{
+ "generated_from": "17 条裁决样本",
+ "note": "由实测样本聚合；value 为众数，n 为样本数，dissent 为异见值。**在 conflicts 清空前不要直接覆盖 tables.json**。",
+ "vehicle_result": {
+  "复合装甲|7": {
+   "6": {
+    "value": 1,
+    "n": 1,
+    "dissent": {}
+   },
+   "7": {
+    "value": 2,
+    "n": 1,
+    "dissent": {}
+   }
+  },
+  "复合装甲|10": {
+   "2": {
+    "value": 3,
+    "n": 1,
+    "dissent": {}
+   },
+   "3": {
+    "value": 3,
+    "n": 1,
+    "dissent": {}
+   },
+   "4": {
+    "value": 1,
+    "n": 3,
+    "dissent": {}
+   },
+   "5": {
+    "value": 1,
+    "n": 4,
+    "dissent": {}
+   },
+   "6": {
+    "value": 1,
+    "n": 1,
+    "dissent": {}
+   },
+   "7": {
+    "value": 3,
+    "n": 2,
+    "dissent": {}
+   },
+   "8": {
+    "value": 2,
+    "n": 1,
+    "dissent": {}
+   },
+   "9": {
+    "value": 2,
+    "n": 1,
+    "dissent": {}
+   },
+   "10": {
+    "value": 2,
+    "n": 1,
+    "dissent": {}
+   }
+  }
+ },
+ "person_result": {},
+ "state_mod": {
+  "机动": {
+   "4": {
+    "value": -2,
+    "n": 2,
+    "dissent": {}
+   },
+   "5": {
+    "value": -2,
+    "n": 3,
+    "dissent": {}
+   },
+   "6": {
+    "value": -1,
+    "n": 2,
+    "dissent": {}
+   },
+   "7": {
+    "value": -1,
+    "n": 2,
+    "dissent": {}
+   },
+   "8": {
+    "value": -1,
+    "n": 4,
+    "dissent": {}
+   },
+   "9": {
+    "value": 0,
+    "n": 2,
+    "dissent": {}
+   },
+   "10": {
+    "value": 0,
+    "n": 1,
+    "dissent": {}
+   },
+   "12": {
+    "value": 0,
+    "n": 1,
+    "dissent": {}
+   }
+  }
+ },
+ "conflicts": [],
+ "sample_count": 17,
+ "skipped": 0
+}

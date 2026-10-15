@@ -1,0 +1,76 @@
+/* 综合态势棋子顶部名称显示效果 */
+#object div i {
+position:absolute;
+top:-2px !important; /* 距棋子顶部的距离 */
+left:50%;
+padding:2px;
+width:auto;
+transform: translate(-50%, 0) scale(0.6,0.8);
+font-family:'宋体'; /* 字体 */
+font-size:18px; /* 字体大小 */
+font-style:normal;
+white-space:nowrap;
+-webkit-text-shadow:none !important;
+-moz-text-shadow:none !important;
+text-shadow:none !important;
+z-index:100 !important;
+//opacity:0.8; /* 透明度 */
+}
+
+#object.light div i {
+top:20px !important;
+}
+
+#object.icon.light div i {
+top:17px !important;
+}
+
+#object div[color='RED'] i {
+color:#fff;
+background:red;
+border:2px red solid;
+}
+
+#object div[color='BLUE'] i {
+color:#fff;
+background:blue;
+border:2px blue solid;
+}
+
+#object div[color='GREEN'] i {
+color:#fff;
+background:green;
+border:2px green solid;
+}
+
+#object.icon div i {
+padding:0px !important;
+height:18px !important;
+line-height:18px !important;
+color:#fff !important;
+}
+
+#object div[ico='MAN7'] i {
+top:-20px !important;
+width:30px;
+height:30px;
+line-height:30px;
+border-radius:30px;
+}
+
+#TeamTitle {
+position:fixed;
+padding:10px;
+text-align:center;
+bottom:10px;
+left:50%;
+transform:translate(-50%, 0);
+font-family:'楷体';
+font-size:25px;
+font-weight:bold;
+background:#fff;
+}
+
+#TeamTitle span {
+margin:0 20px;
+}

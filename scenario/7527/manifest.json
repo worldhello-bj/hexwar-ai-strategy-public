@@ -1,0 +1,58 @@
+{
+ "scenario_id": 7527,
+ "name": "城市攻防作战（2V2）",
+ "published_at": "2026-10-15 23:41:20",
+ "source": {
+  "practice": "http://www.hexwar.cn/WARGAMEAI/",
+  "compete": "http://43.143.209.228/WARGAMEAI",
+  "endpoints": [
+   "User_Get.asp",
+   "Map_Get.asp",
+   "Obj_Get.asp",
+   "ObjAjax.asp",
+   "City_Get.asp"
+  ],
+  "note": "公开练习服抓取后解析；units.json 已对齐 RoomStart 后的真实开局"
+ },
+ "counts": {
+  "hexes": 2721,
+  "units": 36,
+  "cities": 3,
+  "grid": "100x18",
+  "colors": {
+   "BLUE": 18,
+   "RED": 18
+  }
+ },
+ "files": {
+  "cities.json": {
+   "sha1": "f9e118a05ed4ea3fdaa667d88780326a2acb8ff0",
+   "bytes": 414
+  },
+  "map_hexes.json": {
+   "sha1": "f364ddf238924858bb56b0719e2c64d64c33b6b3",
+   "bytes": 365083
+  },
+  "units.json": {
+   "sha1": "a227869e5cc23c50fc648e435a0b73e781ac8b28",
+   "bytes": 47154
+  }
+ },
+ "sensitive_scan": {
+  "checked": [
+   "Cookie 头",
+   "会话 ID",
+   "账号字段",
+   "本机账号名",
+   "签名"
+  ],
+  "hits": [],
+  "verdict": "无 Cookie / 会话 ID / 账号 / 签名命中"
+ },
+ "excluded_on_purpose": [
+  "session.pkl 与 *_logged_in.html（本地会话/账号身份）",
+  "raw/（原始响应，含响应头）",
+  "manual_tables*.json / manual_grid.json（比赛手册的表格衍生物）",
+  "units.har.json（HAR 中局版本）"
+ ]
+}

@@ -1,0 +1,2 @@
+# CPU-only generalizing policy baseline; engine remains standard-library only.
+numpy==2.3.5

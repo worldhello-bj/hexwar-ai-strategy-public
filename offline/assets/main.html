@@ -1,0 +1,191 @@
+<!DOCTYPE html><html>
+<head>
+<meta charset="gbk"/>
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1" />
+<meta name="copyright" content="济南棋战网络科技有限公司" />
+<meta name="author" content="陶伟" />
+<title>兵棋推演平台</title>
+<script type="text/javascript" src="lib/jquery-1.8.3.min.js"></script>
+
+<link href="war.min.css" type="text/css" rel="stylesheet" />
+
+<!-- <link href="common.css" type="text/css" rel="stylesheet" />
+<link href="style.css" type="text/css" rel="stylesheet" />
+<link href="object.css" type="text/css" rel="stylesheet" />
+<link href="file.css" type="text/css" rel="stylesheet" />
+<link href="war.command.css" type="text/css" rel="stylesheet" />
+<link href="grid.css" type="text/css" rel="stylesheet" /> -->
+
+<link href="user.css" type="text/css" rel="stylesheet" />
+<style>
+.btn,.btn-min {
+font-family:'宋体' !important;
+}
+select,input[type='button'] {
+font-family:'宋体' !important;
+}
+</style>
+</head>
+<body oncontextmenu="ClearPath();return false;" onselectstart="return false" onresize="OnResize()">
+
+<div id="nav" class="bar">
+	<select id="selector1" onchange="ChangeGmap(this.value);this.blur();">
+	<option value="hexcolor">兵棋图</option>
+	<option value="hybrid">卫星图</option>
+	<option value="terrain">地形图</option>
+	<option value="user">背景图</option>
+	</select>
+	<select onchange="GridModeChange(this.value);this.blur();">
+	<option value="0">六角格</option>
+	<option value="1">方里格</option>
+	<option value="2">无网格</option>
+	</select>
+	<select onchange="IconToggle(this.value);this.blur();">
+	<option value="0">模型</option>
+	<option value="1">图标</option>
+	<option value="2">算子</option>
+	</select>
+	<!-- <label for="LightMode"><input class="btn-min" id="LightMode" type="checkbox" onclick="ObjLightToggle(this.checked)" />棋子</label> -->
+	<!-- <label for="AreaMode"><input class="btn-min" id="AreaMode" type="checkbox" onclick="ObjAreaToggle(this.checked)" />军标</label> -->
+	<label for="RoomAttLine"><input class="btn-min" id="RoomAttLine" type="checkbox" onclick="AttackLineShow(this.checked)" />射击线</label>
+	<!-- <label for="GridMode"><input class="btn-min" id="GridMode" type="checkbox" onclick="GridToggle(this.checked)" checked />网格</label> -->
+	<!-- <label for="MeterGridMode"><input class="btn-min" id="MeterGridMode" type="checkbox" onclick="MeterGrid(this.checked)" />方里格</label> -->
+	<label for="MapHexMode"><input class="btn-min" id="MapHexMode" type="checkbox" onclick="MapHexToggle(this.checked)" checked />地形</label>
+	<label for="MapIDMode"><input class="btn-min" id="MapIDMode" type="checkbox" onclick="ChangeMapID(this.checked)" />高程</label>
+	<!-- <label for="MapStepMode"><input class="btn-min" id="MapStepMode" type="checkbox" onclick="MapStepToggle(this.checked)" />通行等级</label> -->
+	<input class="icon icon-ruler" type="button" onclick="PaintShow()" value="测量" />
+	<input class="icon" type="button" onclick="window.open('test/')" value="测速" />
+	<input class="icon" type="button" onclick="Start()" value="推演开始" id="BtnStart" />
+	<!-- <input class="icon" type="button" onclick="loadReport()" value="刷新战报" /> -->
+	<input class="icon" type="button" onclick="Quit()" value="退出推演" />
+	<!-- <input class="icon" type="button" onclick="UserUpdate()" value="系统升级" /> -->
+</div>
+
+<div id="RoomClock" class="bar"></div>
+
+<div id="RoomTime" class="bar"><div id="RoomWeather"></div><span></span></div>
+
+<div id="Report" class="up" onclick="StatShow()">
+<div class="ReportStr"></div>
+<div class="SysStr"></div>
+<div class="bg"></div>
+</div>
+
+<div id="CommandForm"></div>
+
+<div id="CommandList">
+<textarea id="command" style="display:none"></textarea>
+<div id="CommandTask"></div>
+</div>
+
+<div id="CtrlBtn" style="display:none">
+<input type="button" onclick="AllCtrl()" value="控制" class="btn red" />
+<input type="button" onclick="AllObjMove()" value="机动" class="btn red" id="AllMoveBtn" />
+<input type="button" onclick="AllAttack()" value="打击" class="btn red" id="AllAttackBtn" />
+<!-- <input type="button" onclick="AllGetOn()" value="装载" class="btn red" /> -->
+<!-- <input type="button" onclick="AllGetOff()" value="卸载" class="btn red" /> -->
+<input type="button" onclick="AllAI()" value="AI" class="btn red" />
+</div>
+
+<div id="taskBtn" class="bar">
+
+	<!-- <input type="button" onclick="loadInfo()" value="任务" class="btn" /> -->
+	<!-- <input type="button" onclick="ReadMe()" value="想定" class="btn" /> -->
+	<!-- <input type="button" onclick="ArmyList()" value="编成" class="btn" /> -->
+	<!-- <input type="button" onclick="Zhanguo()" value="战果" class="btn" /> -->
+	<input type="button" onclick="Zhansun()" value="战损" class="btn" />
+	<input type="button" onclick="GameScore()" value="成绩" class="btn" />
+	<!-- <input type="button" onclick="ObjGroup()" value="编组" class="btn" />
+	<input type="button" onclick="ObjGroupTask()" value="任务" class="btn" /> -->
+	<select id="armys" class="big" style="max-width:100px;vertical-align:-6px;display:none;" onchange="SelectObj(this.value);this.blur();"></select>
+
+</div>
+
+<div id="Door"></div>
+
+<div id="wrapper">
+
+<div id="main">
+
+<div id="flag"></div>
+
+<!--body-->
+<div id="body">
+
+<!-- <div id="scale-icon"></div> -->
+
+<div id="map3"></div>
+
+<div id="grid"></div>
+
+<div id="grid-value"></div>
+
+<div id="map">
+
+</div>
+
+<div id="score"></div>
+
+<div id="city"></div>
+
+<div id="object"></div>
+
+<div id="object2"></div>
+
+<div id="jm"></div>
+
+<div id="offlinemapdata"></div>
+
+<div id="fire"></div>
+
+<div id="ObjSel"></div>
+
+<canvas id="cv"></canvas>
+
+</div>
+<!--body-->
+
+</div><!-- main -->
+
+</div><!-- wrapper -->
+
+<div id="ObjMenu">
+	<span title="关闭" onclick="hidemenuie5();" class="btn-close"></span>
+	<div id="ObjName"></div>
+	<div id="ObjSelect"></div>
+	<div id="ObjBtns"></div>
+	<!-- <div id="ObjCommand"></div> -->
+</div>
+
+<!-- 画板模块 -->
+<script type="text/javascript" src="lib/paint/paint.js"></script>
+<canvas id="paint"></canvas>
+<!-- 画板模块 -->
+
+<script type="text/javascript" src="lib/jAlert/js/jquery.alerts.js"></script>
+<link type="text/css" href="lib/jAlert/css/jquery.alerts.css" rel="stylesheet" media="screen" />
+
+<script>document.write("<script src='SetUp.js?rnd="+Math.random()+"'></s"+"cript>")</script>
+<script>document.write("<script src='war.min.js?rnd="+Math.random()+"'></s"+"cript>")</script>
+
+<!-- <script>document.write("<script src='common.js?rnd="+Math.random()+"'></s"+"cript>")</script>
+<script>document.write("<script src='mapwar.offline.js?rnd="+Math.random()+"'></s"+"cript>")</script>
+<script>document.write("<script src='war.command.js?rnd="+Math.random()+"'></s"+"cript>")</script>
+<script>document.write("<script src='Menu.js?rnd="+Math.random()+"'></s"+"cript>")</script>
+<script>document.write("<script src='Analysis.js?rnd="+Math.random()+"'></s"+"cript>")</script>
+<script>document.write("<script src='CommArea.js?rnd="+Math.random()+"'></s"+"cript>")</script>
+<script>document.write("<script src='grid.js?rnd="+Math.random()+"'></s"+"cript>")</script> -->
+
+<script type="text/javascript" src="lib/move.js"></script>
+<script type="text/javascript" src="lib/iscroll/iscroll-zoom.js"></script>
+<script type="text/javascript">
+var myScroll;
+function loaded() {
+	myScroll = new IScroll('#wrapper', { scrollX: true, freeScroll: true, preventDefault:false, bounce:false, momentum: false, zoom: true, mouseWheel:true, wheelAction: 'zoom', zoomMax: 2.5, zoomMin: 0.5});
+}
+document.addEventListener('touchmove', function (e) { e.preventDefault(); }, false);
+</script>
+
+</body>
+</html>

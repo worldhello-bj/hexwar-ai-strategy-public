@@ -1,0 +1,13 @@
+{
+ "note": "冒烟：**比赛初设**（想定 7527 真实地图与编成）上跑几局，确认环境没坏；不涉及任何合成样例",
+ "snapshot": "../scenario/7527",
+ "allow_real_map": true,
+ "episodes": 3,
+ "move_radius": 4,
+ "max_seconds": 1200,
+ "max_steps": 600,
+ "scoring": "verified",
+ "seed": 0,
+ "checkpoint": "analysis/mc_smoke.json",
+ "report": "analysis/mc_smoke_report.json"
+}

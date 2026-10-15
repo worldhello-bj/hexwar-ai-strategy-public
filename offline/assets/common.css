@@ -1,0 +1,352 @@
+a {
+text-decoration:none;
+}
+
+ul,li {
+margin:0;
+padding:0;
+list-style:none;
+}
+
+input,select {
+font-size:9pt;
+}
+
+input[type='radio'] {
+vertical-align:-6px;
+}
+
+input[type='checkbox'] {
+vertical-align:-6px;
+}
+
+input[type='number'] {
+padding-right:0;
+width:36px;
+}
+
+input[type='submit'],input[type='button'] {
+font-family:'宋体';
+vertical-align:middle;
+}
+
+input[type='text'],input[type='password'] {
+font-family:'Arial' !important;
+font-size:12px !important;
+height:19px;
+vertical-align:1px;
+cursor:text;
+border-top:2px #bebebe solid;
+border-left:2px #bebebe solid;
+border-right:2px #e1e1e1 solid;
+border-bottom:2px #e1e1e1 solid;
+}
+
+input[type='button'].active {
+color:#fff;
+background:#ff0000 !important;
+}
+
+select {
+font-family:'宋体' !important;
+font-size:9pt;
+vertical-align:middle;
+height:23px;
+color:#99B994;
+background:#2C3031;
+border-color:#999;
+}
+
+select.middle {
+font-size:18px !important;
+height:26px !important;
+}
+
+select.big {
+font-size:25px !important;
+height:33px !important;
+}
+
+#loading {
+position:fixed;
+width:100%;
+height:100%;
+color:#fff;
+background:#000;
+z-index:99999;
+}
+
+#cv {
+display:none; /* cv根据需要显示，否则点打击时，正在机动的棋子会点不上，此时应隐藏cv */
+}
+
+.btn {
+display:inline-block;
+margin:0 3px;
+padding:0 10px;
+height:30px;
+vertical-align:middle;
+line-height:30px;
+text-align:center;
+font-family:'宋体' !important;
+font-size:18px;
+font-weight:bold;
+color:#fff;
+border:1px #000 solid;
+background:#93632f;
+cursor:pointer;
+}
+
+.btn.RED,.btn.red {
+background:#992928;
+}
+
+.btn.BLUE,.btn.blue {
+background:#374D59;
+}
+
+.btn.GREEN,.btn.green {
+background:#4f593f;
+}
+
+.btn:hover,.btn.current {
+border-color:#fff;
+}
+
+.btn.highlight {
+background:#ff7300;
+border-top:2px #facc89 solid;
+border-right:2px #facc89 solid;
+border-bottom:2px #a74200 solid;
+border-left:2px #a74200 solid;
+}
+
+input.btn {
+height:33px;
+line-height:33px;
+}
+
+center .btn {
+margin:5px;
+}
+
+.btn-min {
+display:inline-block;
+padding:0 10px;
+height:23px !important;
+line-height:23px !important;
+font-family:'宋体' !important;
+font-size:9pt !important;
+font-weight:bold;
+color:#e4e6e8;
+background:#485159;
+border:1px #485159 solid;
+cursor:pointer;
+}
+
+select.btn-min {
+cursor:default;
+}
+
+option.RED {
+background:red !important;
+}
+
+option.BLUE {
+background:blue !important;
+}
+
+.btn-min.max {
+padding-top:2px;
+height:26px !important;
+line-height:26px !important;
+font-size:16px !important;
+}
+
+.btn-min.red {
+color:#fff;
+background:#ed1a20;
+}
+
+.btn-min.blue {
+color:#fff;
+background:#1999ff;
+}
+
+.btn-min.green {
+color:#fff;
+background:#83a605;
+}
+
+.btn-min.yellow {
+color:#fff;
+background:#e58716;
+}
+
+.btn-min.current {
+border-color:#fff;
+}
+
+.btn-min:hover {
+border-color:#999;
+}
+
+.btn-min.star {
+padding:0 10px 0 22px !important;
+background:#485159 url(skin/index-button-active.png) no-repeat 5px 5px;
+background-size:12px 12px;
+}
+
+.btn-min.star.red {
+background:#ed1a20 url(skin/index-button-active.png) no-repeat 5px 5px;
+background-size:12px 12px;
+}
+
+.btn-close {
+display:inline-block;
+position:absolute;
+right:10px;
+top:10px;
+padding:0;
+width:36px;
+height:36px;
+background:url(skin/btn-close.png) no-repeat;
+background-size:contain;
+z-index:999;
+}
+
+.btn-add {
+display:inline-block;
+position:absolute;
+right:5px;
+top:5px;
+padding:0;
+width:16px;
+height:16px;
+background:url(skin/btn-add.png) no-repeat;
+background-size:contain;
+z-index:999;
+}
+
+input[type=submit].btn-min {
+background:#d6241c;
+}
+
+fieldset {
+border:1px #666 solid;
+}
+
+fieldset label {
+display:inline-block;
+margin:10px;
+}
+
+table.min td {
+font-size:9pt;
+border-color:#666 !important;
+}
+
+table.min th {
+background:#394552 !important;
+border-color:#666 !important;
+}
+
+table.max td {
+font-size:20px;
+}
+
+.bg-RED {
+background:red !important;
+}
+
+.bg-BLUE {
+background:blue !important;
+}
+
+.bg-GREEN {
+background:green !important;
+}
+
+.bg-BLACK {
+background:black !important;
+}
+
+.color-RED {
+color:red;
+}
+
+.color-BLUE {
+color:blue;
+}
+
+.color-GREEN {
+color:green;
+}
+
+.color-YELLOW {
+color:yellow;
+}
+
+.text-RED {
+color:red !important;
+}
+
+.text-BLUE {
+color:blue !important;
+}
+
+.text-GREEN {
+color:green !important;
+}
+
+.text-min * {
+font-size:12px;
+}
+
+.color1 {
+color:#000 !important; /* 一级疲劳 */
+}
+
+.color2 {
+color:#ff0000 !important; /* 二级疲劳 */
+}
+
+.text-shadow {
+font-weight:bold;
+-moz-text-shadow: 1px 1px 1px #000;
+-webkit-text-shadow: 1px 1px 1px #000;
+text-shadow: 1px 1px 1px #000;
+}
+
+#paint {
+display:none;
+overflow:hidden;
+position:fixed;
+top:0px;
+left:0px;
+z-index:9999;
+cursor:crosshair;
+}
+
+table.score {
+font-size:28px;
+}
+
+#UserStat {
+position:fixed;
+left:10px;
+top:60px;
+z-index:999;
+}
+
+#UserStat p {
+margin:0;
+padding:0;
+text-align:left;
+font-size:12px;
+line-height:16px;
+}
+
+#popup_container {
+font-family:'宋体';
+}

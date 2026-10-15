@@ -1,0 +1,20 @@
+{
+ "note": "比赛初设 7527 PPO 基线（与 docs/真实地图训练.md 记录的 ppo160 同参数）；奖励默认走 verified 口径（三项分值均已平台实测）",
+ "snapshot": "../scenario/7527",
+ "allow_real_map": true,
+ "episodes": 160,
+ "move_radius": 3,
+ "batch_episodes": 8,
+ "max_seconds": 1200,
+ "update_mode": "ppo_clip",
+ "ppo_clip": 0.2,
+ "update_epochs": 4,
+ "buckets": 4096,
+ "hidden_dim": 64,
+ "learning_rate": 0.001,
+ "scoring": "verified",
+ "seed": 0,
+ "eval_seeds": [1000000, 1000001],
+ "checkpoint": "analysis/realmap/ppo160.json",
+ "report": "analysis/realmap/ppo160_report.json"
+}
