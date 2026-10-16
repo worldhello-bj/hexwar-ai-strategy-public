@@ -194,6 +194,23 @@ def t2_gates(fixture):
     check("T2", "敌方车辆不能作为载体（所属关系只能是自己人）",
           not ok and "己方" in why, why)
 
+    g4 = Game(seed=6, snapshot=fixture)                 # 默认 opening
+    g4.start()
+    g4.advance(5)
+    ok, why = g4.deploy_missile("carrier", "missileA")
+    check("T2", "默认窗口是 `opening`：过了第 0 秒就不能部署（手册 4.10(3)）",
+          not ok and "开始前" in why, why)
+    g5 = Game(seed=6, snapshot=fixture, deploy_window="any")
+    g5.start()
+    g5.advance(5)
+    ok, why = g5.deploy_missile("carrier", "missileA")
+    check("T2", "窗口可配：`deploy_window=\"any\"` 下未发射前随时可部署（训练用）",
+          ok and g5.missile_state(g5.units["missileA"]) == "carried", why)
+    g5.launch_missile("carrier", "missileA")
+    g5.advance(g5.loiter_sec + 1)
+    check("T2", "放宽窗口也不会复活已消耗/已损失的弹",
+          not g5.deploy_missile("carrier", "missileA")[0])
+
 
 # ---------------------------------------------------------------- T3
 def t3_interface(fixture):

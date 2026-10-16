@@ -49,6 +49,13 @@ LOITER_SEC_PLACEHOLDER = 120    # 早前的无来源占位值，保留仅作对�
 # 巡飞弹的显式生命周期状态（见 `Game.missile_state`）。
 MISSILE_STATES = ("unassigned", "carried", "loitering", "spent", "lost")
 
+# 部署（上车）窗口（手册 4.10(3)：“需在对抗开始前上车确定所属关系”）：
+#   "opening"（默认）—— 只接受 `second == 0`，即本环境里唯一能代表“对抗开始前”的时刻；
+#   "any"            —— 只要该弹**尚未发射**（仍为 `unassigned`）就允许部署。
+# 环境没有赛前阶段（`reset()` 后 `started` 已为真），所以“开局窗口”只是一个**口径**：
+# 默认取忠实手册的 `opening`，要训练里能学到用弹就显式传 `any`（不静默偏离）。
+DEPLOY_WINDOWS = ("opening", "any")
+
 
 class Unit:
     __slots__ = ("id", "data", "name", "army", "group", "typeid", "color", "pos",
@@ -177,7 +184,8 @@ class Unit:
 class Game:
     """一局推演。完全本地，无外部依赖。"""
 
-    def __init__(self, seed=None, snapshot=None, room_speed=None, loiter_sec=None):
+    def __init__(self, seed=None, snapshot=None, room_speed=None, loiter_sec=None,
+                 deploy_window=None):
         if room_speed is not None and (isinstance(room_speed, bool)
                                        or not isinstance(room_speed, (int, float))
                                        or room_speed <= 0):
@@ -186,7 +194,13 @@ class Game:
                                        or not isinstance(loiter_sec, (int, float))
                                        or loiter_sec <= 0):
             raise ValueError("loiter_sec must be a positive number")
+        if deploy_window is None:
+            deploy_window = "opening"
+        if deploy_window not in DEPLOY_WINDOWS:
+            raise ValueError("deploy_window must be one of %s" % (DEPLOY_WINDOWS,))
         self.rng = random.Random(seed)
+        # 巡飞弹部署窗口（见 `DEPLOY_WINDOWS`）：默认“对抗开始前”。
+        self.deploy_window = deploy_window
         # 巡飞超时上限（秒）：默认按客户端公式 `parseInt(1200 / RoomSpeed)` 算，
         # 允许显式覆盖；取值与来源逐弹记进 `detail`（**不假装已实测**）。
         self.room_speed = DEFAULT_ROOM_SPEED if room_speed is None else room_speed
@@ -218,6 +232,9 @@ class Game:
         # 固定到**载具 ID** 上；否则载具一机动，`pos2` 变旧格，载员的分值就会
         # 从计分里凭空消失（等于惩罚机动）。见 `docs/计分规则待确认.md`。
         self.link_carried()
+        # 数据里**显式写明**的归属（`car` = 载具 ID）也要在载入时落成车内状态：
+        # 这是“初设即已部署上车”的表达方式（与上面那一步的**证据推断**不同）。
+        self.link_declared_carriers()
 
         self.started = False
         self.t0 = 0.0          # 推演开始时刻
@@ -232,6 +249,44 @@ class Game:
         self.start_str = ""    # 开始时刻的日期串（客户端时钟用）
 
     # ---------------- 载员-载具关联 ----------------
+    def link_declared_carriers(self):
+        """把数据里**显式声明**的所属关系（`car` 字段）落成车内状态。
+
+        平台想定里可以用 `car=<载具ID>` + `pos=0` / `pos2=<载具格>` / `blood=0` / `color=''`
+        表达“**开局就在车内**”（初设即已部署上车）。本函数只读这个**写明的**字段，
+        不做任何推断（同格、载具 `son` 图标串、武器 76 都**不**构成归属证据 ——
+        issue #1 明确禁止静默推断；那段逻辑只在 `link_carried()` 里处理“无阵营、
+        `pos=0`、`blood=0`”的旧快照记录，且要求唯一命中）。
+
+        `car=Obj_0`（本仓库初设的取值）或空串 ⇒ 无归属，**不会**建立任何关系。
+        返回本次落成的单位 id 列表（供核对/测试；`units.json` 未声明时为空）。
+        """
+        self.carried_declared = []
+        self.carried_declare_unlinked = []
+        for u in sorted(self.units.values(), key=lambda x: str(x.id)):
+            cid = u.detail.get("car")
+            if not cid or u.detail.get("carrier") or cid == u.id:
+                continue
+            host = self.units.get(cid)
+            if host is None:
+                # 写了归属但载具不在场：不静默忽略，记下来由调用方/测试报出。
+                self.carried_declare_unlinked.append((u.id, cid))
+                continue
+            u.detail["carrier"] = host.id
+            host.detail.setdefault("carried", []).append(u.id)
+            # 车内读不到兵力与阵营（平台口径）：编制留在 `establishment`。
+            u.establishment = u.establishment or u.blood
+            u.blood = 0
+            u.color = ""
+            if u.is_loitering_missile():
+                u.detail["missile_state"] = "carried"
+            if u.pos:
+                # 车内记录的平台形态：`pos=0`、`pos2`= 载具格。
+                u.pos2 = u.pos2 or host.pos
+                u.pos = 0
+            self.carried_declared.append(u.id)
+        return list(self.carried_declared)
+
     def link_carried(self):
         """把快照里「人在车内」的记录与载具建立**稳定**关联。
 
@@ -489,7 +544,7 @@ class Game:
             return "巡飞弹当前状态为 %s，不能部署上车" % state
         if not self.started:
             return "对抗尚未开始"
-        if self.second != 0:
+        if self.deploy_window == "opening" and self.second != 0:
             return "巡飞弹须在对抗开始前上车（手册 4.10(3)）"
         if not c.alive():
             return "载车已被消灭"

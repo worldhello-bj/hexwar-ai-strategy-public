@@ -80,6 +80,7 @@ FLAGS = {
     "eval_seeds": "--eval-seeds",
     "max_seconds": "--max-seconds",
     "max_steps": "--max-steps",
+    "deploy_window": "--deploy-window",
     "epsilon": "--epsilon",
     "batch_episodes": "--batch-episodes",
     "buckets": "--buckets",
@@ -104,15 +105,17 @@ FLAGS = {
 ALLOWED = {
     "run_episode": ("snapshot", "agent", "episodes", "side", "seed", "max_seconds",
                     "max_steps", "move_radius", "deep_validate", "scoring",
-                    "no_fog", "render"),
+                    "no_fog", "render", "deploy_window"),
     "mc": ("snapshot", "allow_real_map", "move_radius", "deep_validate", "episodes",
            "scoring", "seed", "epsilon", "train_seed_start", "eval_seeds",
-           "max_seconds", "max_steps", "checkpoint", "resume", "report"),
+           "max_seconds", "max_steps", "checkpoint", "resume", "report",
+           "deploy_window"),
     "ppo": ("snapshot", "allow_real_map", "move_radius", "deep_validate", "episodes",
             "seed", "train_seed_start", "eval_seeds", "batch_episodes", "max_seconds",
             "max_steps", "buckets", "hidden_dim", "learning_rate",
             "observation_schema", "baseline_offset", "update_mode", "scoring",
-            "ppo_clip", "update_epochs", "checkpoint", "resume", "report"),
+            "ppo_clip", "update_epochs", "checkpoint", "resume", "report",
+            "deploy_window"),
     "eval": ("checkpoint", "snapshot", "seeds", "report", "allow_real_map"),
     "diff": ("snapshot", "radius", "steps"),
 }
@@ -273,6 +276,9 @@ def main():
     ap.add_argument("--config")
     ap.add_argument("--algo", choices=("mc", "ppo"), default="ppo")
     ap.add_argument("--live", action="store_true", help="rules 时加上线上样本对账")
+    ap.add_argument("--deploy-window", choices=("opening", "any"), default=None,
+                    help="巡飞弹部署（上车）窗口：opening=对抗开始前（手册 4.10(3)，默认）；"
+                         "any=未发射前随时（训练里要学到用弹就选它）")
     ap.add_argument("--dry-run", action="store_true", help="只打印命令行，不执行")
     args, extra = ap.parse_known_args()
 
@@ -312,6 +318,12 @@ def main():
         raise SystemExit("eval 需要 --seeds（或在配置里给 seeds）")
     if sub in ("mc", "ppo") and not (cfg.get("checkpoint") or "--checkpoint" in extra):
         raise SystemExit("%s 需要 checkpoint（或在配置里给 checkpoint）" % sub)
+    # `--deploy-window` 是 run_train 自己解析的（不在 `extra` 里），要显式转发给子命令；
+    # 放在 CLI 末尾 ⇒ 覆盖配置里的同名键（与"命令行覆盖配置"同一约定）。
+    if args.deploy_window:
+        if sub not in ("run_episode", "mc", "ppo"):
+            raise SystemExit("--deploy-window 只对 env / mc / ppo 有意义")
+        extra = extra + ["--deploy-window", args.deploy_window]
     argv = to_argv(cfg) + extra
     if sub == "eval":
         ck = cfg.get("checkpoint")

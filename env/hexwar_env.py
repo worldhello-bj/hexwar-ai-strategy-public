@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from engine import Game, geometry as G
 from engine.equip import WEAPONS, EQUIPMENT, AMMO_FIELD
+from engine.game import DEPLOY_WINDOWS
 from engine import crt
 from engine import scoring
 
@@ -78,11 +79,14 @@ class HexwarEnv:
 
     def __init__(self, snapshot=None, side="BLUE", max_seconds=1800,
                  fog=True, dt=WAIT_SEC, victory="score", move_radius=6,
-                 deep_validate=False, scoring_mode="verified"):
+                 deep_validate=False, scoring_mode="verified",
+                 deploy_window="opening"):
         if side not in ("BLUE", "RED"):
             raise ValueError("side must be BLUE or RED")
         if scoring_mode not in ("verified", "platform"):
             raise ValueError("scoring_mode must be 'verified' or 'platform'")
+        if deploy_window not in DEPLOY_WINDOWS:
+            raise ValueError("deploy_window must be one of %s" % (DEPLOY_WINDOWS,))
         if not isinstance(max_seconds, int) or isinstance(max_seconds, bool) or max_seconds < 0:
             raise ValueError("max_seconds must be a non-negative integer")
         if not isinstance(dt, int) or isinstance(dt, bool) or dt <= 0:
@@ -106,13 +110,17 @@ class HexwarEnv:
         # `platform` 与 `verified` 现在数值相同（三项分值都已实测），保留两个口径是为了
         # 将来一旦出现新的未实测项时能自动把它挡在奖励之外（仅用于对账/展示时才显式传 platform）。
         self.scoring_mode = scoring_mode
+        # 巡飞弹部署（上车）窗口：`"opening"`（默认，手册 4.10(3) 的“对抗开始前”）/ `"any"`
+        # （未发射前任意时刻）—— 训练要用弹时显式传 `any`，不静默偏离。
+        self.deploy_window = deploy_window
         self.game = None
         self.done = False
         self._history = []
 
     # ---------------- 生命周期 ----------------
     def reset(self, seed=None):
-        self.game = Game(seed=seed, snapshot=self.snapshot)
+        self.game = Game(seed=seed, snapshot=self.snapshot,
+                         deploy_window=self.deploy_window)
         self.game.start()
         self.game.second = 0
         self.done = False

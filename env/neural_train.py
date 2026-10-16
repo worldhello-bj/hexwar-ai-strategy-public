@@ -16,6 +16,7 @@ import time
 import numpy as np
 
 from engine import scoring
+from engine.game import DEPLOY_WINDOWS
 from .episode_api import TwoPlayerEpisode
 from .match_eval import SIDES, _positive_int, snapshot_manifest
 from .neural_policy import NeuralPolicy, Decision
@@ -292,6 +293,9 @@ def main(argv=None):
     parser.add_argument("--batch-episodes", type=int, default=4)
     parser.add_argument("--max-seconds", type=int, default=1800)
     parser.add_argument("--max-steps", type=int, default=1000)
+    parser.add_argument("--deploy-window", choices=DEPLOY_WINDOWS, default="opening",
+                        help="巡飞弹部署（上车）窗口：opening=对抗开始前（手册 4.10(3)，默认）；"
+                             "any=未发射前随时（训练里要学到用弹就选它）")
     parser.add_argument("--buckets", type=int, default=2048)
     parser.add_argument("--hidden-dim", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=0.001)
@@ -354,7 +358,8 @@ def main(argv=None):
     if args.checkpoint.exists() or args.report.exists() or args.checkpoint.resolve() == args.report.resolve():
         parser.error("choose separate new checkpoint and report paths")
     try:
-        episode_config = {"max_seconds": args.max_seconds, "max_steps": args.max_steps}
+        episode_config = {"max_seconds": args.max_seconds, "max_steps": args.max_steps,
+                          "deploy_window": args.deploy_window}
         if args.move_radius is not None:
             episode_config["move_radius"] = args.move_radius
         if args.deep_validate:

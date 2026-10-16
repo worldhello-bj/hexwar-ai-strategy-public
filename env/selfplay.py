@@ -17,6 +17,7 @@ import time
 import tracemalloc
 
 from engine import scoring
+from engine.game import DEPLOY_WINDOWS
 from .episode_api import TwoPlayerEpisode
 from .match_eval import SIDES, _positive_int, snapshot_manifest, write_synthetic_snapshot
 
@@ -216,6 +217,9 @@ def main(argv=None):
     parser.add_argument("--train-seed-start", type=int, default=0)
     parser.add_argument("--eval-seeds", nargs="+", type=int, default=[1000000, 1000001])
     parser.add_argument("--max-seconds", type=int, default=60)
+    parser.add_argument("--deploy-window", choices=DEPLOY_WINDOWS, default="opening",
+                        help="巡飞弹部署（上车）窗口：opening=对抗开始前（手册 4.10(3)，默认）；"
+                             "any=未发射前随时（训练里要学到用弹就选它）")
     parser.add_argument("--max-steps", type=int, default=100)
     parser.add_argument("--checkpoint", type=Path, required=True, help="new output checkpoint")
     parser.add_argument("--resume", type=Path)
@@ -229,6 +233,7 @@ def main(argv=None):
         with tempfile.TemporaryDirectory(prefix="synthetic-selfplay-") as tmp:
             snapshot = args.snapshot or write_synthetic_snapshot(Path(tmp) / "fixture")
             episode_config = {"max_seconds": args.max_seconds,
+                              "deploy_window": args.deploy_window,
                               "max_steps": args.max_steps}
             if args.move_radius is not None:
                 episode_config["move_radius"] = args.move_radius

@@ -21,6 +21,7 @@ from agents import AGENTS
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from engine import paths as _paths                       # noqa: E402
+from engine.game import DEPLOY_WINDOWS                    # noqa: E402
 
 # 默认就用**比赛初设**（想定 7527 的真实地图与编成，随仓库分发在 scenario/7527/）；
 # 没有本地完整采集时也不会退化成别的样例（见 engine/paths.py）。
@@ -28,10 +29,12 @@ DEFAULT_SNAP = _paths.snapshot_dir()
 
 
 def run_one(agent, side, seed, snapshot, max_seconds, fog, render=False, verbose=False,
-            move_radius=None, deep_validate=False, scoring_mode="verified"):
+            move_radius=None, deep_validate=False, scoring_mode="verified",
+            deploy_window="opening"):
     env = HexwarEnv(snapshot=snapshot, side=side, max_seconds=max_seconds, fog=fog,
                     **({} if move_radius is None else {"move_radius": move_radius}),
-                    deep_validate=deep_validate, scoring_mode=scoring_mode)
+                    deep_validate=deep_validate, scoring_mode=scoring_mode,
+                    deploy_window=deploy_window)
     scoring_key = "verified" if scoring_mode == "verified" else "total"
     obs = env.reset(seed=seed)
     steps = 0
@@ -72,6 +75,9 @@ def main():
                     help="快照目录（默认用自带合成样例；真实想定用 scenario/7527 或"
                          "本地完整采集 snapshot/parsed）")
     ap.add_argument("--max-seconds", type=int, default=1800)
+    ap.add_argument("--deploy-window", choices=DEPLOY_WINDOWS, default="opening",
+                    help="巡飞弹部署（上车）窗口：opening=对抗开始前（手册 4.10(3)，默认）；"
+                         "any=未发射前随时")
     ap.add_argument("--move-radius", type=int, default=None,
                     help="机动枚举半径（默认 6；缩小可显著降低动作空间）")
     ap.add_argument("--deep-validate", action="store_true",
@@ -98,7 +104,8 @@ def main():
                     args.max_seconds, not args.no_fog,
                     render=args.render and i == 0, verbose=args.verbose,
                     move_radius=args.move_radius, deep_validate=args.deep_validate,
-                    scoring_mode=args.scoring_mode)
+                    scoring_mode=args.scoring_mode,
+                    deploy_window=args.deploy_window)
         results.append(r)
         print("第 %2d 局  seed=%-4d  步数=%-5d  己方=%4d 敌方=%4d 净胜=%+4d" %
               (i + 1, r["seed"], r["steps"], r["score"]["own"]["verified"],

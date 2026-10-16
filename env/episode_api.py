@@ -8,7 +8,7 @@ Existing ``match_eval`` evaluation/truncation conventions are unchanged.
 import copy
 import json
 
-from engine.game import Unit
+from engine.game import Unit, DEPLOY_WINDOWS
 from engine import scoring as _scoring
 from .hexwar_env import (ATTACK_SEC, CAPTURE_SEC, HIDE_SEC, LOAD_SEC,
                          GRENADE_SEC, AREA_FIRE_SEC, LAUNCH_SEC,
@@ -44,7 +44,8 @@ class TwoPlayerEpisode:
 
     def __init__(self, snapshot, *, max_seconds=120, max_steps=100,
                  dt=10, move_radius=1, victory="score", public_score=True,
-                 deep_validate=False, scoring_mode="verified"):
+                 deep_validate=False, scoring_mode="verified",
+                 deploy_window="opening"):
         _positive_int("max_seconds", max_seconds, True)
         _positive_int("max_steps", max_steps, True)
         _positive_int("dt", dt)
@@ -57,6 +58,9 @@ class TwoPlayerEpisode:
             raise ValueError("deep_validate must be a boolean")
         if scoring_mode not in ("verified", "platform"):
             raise ValueError("scoring_mode must be 'verified' or 'platform'")
+        if deploy_window not in DEPLOY_WINDOWS:
+            raise ValueError("deploy_window must be one of %s" % (DEPLOY_WINDOWS,))
+        self._deploy_window = deploy_window
         self._scoring_mode = scoring_mode
         self._public_score = public_score
         self._deep_validate = deep_validate
@@ -88,7 +92,8 @@ class TwoPlayerEpisode:
     def reset(self, *, seed=0):
         _positive_int("seed", seed, True)
         session = _SerialSession(self._snapshot, seed, self._max_seconds,
-                                 True, self._dt, self._victory, self._scoring_mode)
+                                 True, self._dt, self._victory, self._scoring_mode,
+                                 self._deploy_window)
         self._session = session
         self._steps = 0
         self._outcome = None

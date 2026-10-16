@@ -43,7 +43,7 @@ import copy
 import json
 import math
 
-from engine.game import Unit
+from engine.game import Unit, DEPLOY_WINDOWS
 from engine import scoring as _scoring
 from .hexwar_env import HexwarEnv, own_units_for_projection
 from .match_eval import SIDES, _SerialSession, _json_copy, _positive_int
@@ -63,7 +63,8 @@ class RealtimeEpisode:
     """
 
     def __init__(self, snapshot, *, max_seconds=1200, move_radius=2, fog=True,
-                 public_score=True, scoring_mode="verified", dt=1):
+                 public_score=True, scoring_mode="verified", dt=1,
+                 deploy_window="opening"):
         _positive_int("max_seconds", max_seconds, True)
         _positive_int("move_radius", move_radius, True)
         if not isinstance(fog, bool) or not isinstance(public_score, bool):
@@ -71,6 +72,9 @@ class RealtimeEpisode:
         if scoring_mode not in ("verified", "platform"):
             raise ValueError("scoring_mode must be 'verified' or 'platform'")
         _positive_int("dt", dt)
+        if deploy_window not in DEPLOY_WINDOWS:
+            raise ValueError("deploy_window must be one of %s" % (DEPLOY_WINDOWS,))
+        self._deploy_window = deploy_window
         self._snapshot = snapshot
         self._max_seconds = max_seconds
         self._move_radius = move_radius
@@ -93,7 +97,8 @@ class RealtimeEpisode:
     def reset(self, *, seed=0):
         _positive_int("seed", seed, True)
         self._session = _SerialSession(self._snapshot, seed, self._max_seconds,
-                                       self._fog, self._dt, "score", self._scoring_mode)
+                                       self._fog, self._dt, "score", self._scoring_mode,
+                                       self._deploy_window)
         self._acted = 0
         self._ticks = 0
         self._outcome = None

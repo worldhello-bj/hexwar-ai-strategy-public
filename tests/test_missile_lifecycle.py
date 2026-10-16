@@ -167,6 +167,45 @@ class MissileLaunchGateTests(MissileFixture):
         self.assertFalse(ok)
         self.assertIn("开始前", why)
 
+    def test_deploy_window_is_configurable(self):
+        """默认 `opening`（忠实手册）；训练需要时可显式传 `any`。"""
+        g = Game(seed=3, snapshot=str(self.root))       # 默认 opening
+        g.start()
+        g.advance(5)
+        self.assertIn("开始前", g.deploy_missile("carrier", "missileA")[1])
+        loose = Game(seed=3, snapshot=str(self.root), deploy_window="any")
+        loose.start()
+        loose.advance(5)
+        self.assertTrue(loose.deploy_missile("carrier", "missileA")[0])
+        self.assertEqual(loose.missile_state(loose.units["missileA"]), "carried")
+        self.assertTrue(loose.launch_missile("carrier", "missileA")[0])
+        loose.advance(loose.loiter_sec + 1)             # 已消耗/已损失仍不复活
+        self.assertFalse(loose.deploy_missile("carrier", "missileA")[0])
+        with self.assertRaises(ValueError):
+            Game(seed=3, snapshot=str(self.root), deploy_window="whenever")
+
+    def test_env_and_wrappers_accept_deploy_window(self):
+        strict = self.env()                             # 默认 opening
+        strict.step({"type": "wait", "seconds": 5})
+        self.assertNotIn({"type": "load", "unit": "missileA", "carrier": "carrier"},
+                         strict.legal_actions())
+        loose = self.env(deploy_window="any")
+        loose.step({"type": "wait", "seconds": 5})
+        self.assertIn({"type": "load", "unit": "missileA", "carrier": "carrier"},
+                      loose.legal_actions())
+        episode = TwoPlayerEpisode(str(self.root), max_seconds=120, max_steps=40,
+                                   move_radius=1, deploy_window="any")
+        episode.reset(seed=3)
+        self.assertEqual(episode._session.env.deploy_window, "any")
+        rt = RealtimeEpisode(str(self.root), max_seconds=30, move_radius=1,
+                             deploy_window="any")
+        rt.reset(seed=3)
+        self.assertEqual(rt._session.env.deploy_window, "any")
+        with self.assertRaises(ValueError):
+            TwoPlayerEpisode(str(self.root), deploy_window="nope")
+        with self.assertRaises(ValueError):
+            RealtimeEpisode(str(self.root), deploy_window="nope")
+
 
 class MissileEnvPipelineTests(MissileFixture):
     def test_deploy_and_launch_reach_the_interface(self):
@@ -364,6 +403,54 @@ class MissileWrapperTests(MissileFixture):
                      episode.legal_actions("RED")[0], side="RED")
         self.assertIn({"type": "launch", "unit": "carrier", "missile": "missileA"},
                       episode.legal_actions("BLUE"))
+
+
+class DeclaredCarriedOpeningTests(MissileFixture):
+    """数据里**显式**写 `car=<载具ID>` ⇒ 初设即已部署上车（载入时就落成车内状态）。
+
+    与 `link_carried()` 的证据推断不同：这里读的是**写明**的归属，
+    且 `car=Obj_0`/空串/指向不存在的单位都**不**建立关系（不静默推断）。
+    """
+
+    def declare(self, unit_id, carrier_id):
+        path = self.root / "units.json"
+        units = json.loads(path.read_text(encoding="utf-8"))
+        for unit in units:
+            if unit["id"] == unit_id:
+                unit["car"] = carrier_id
+        path.write_text(json.dumps(units), encoding="utf-8")
+
+    def test_declared_carrier_becomes_carried_at_load(self):
+        self.declare("missileA", "carrier")
+        g = self.game()
+        m, car = g.units["missileA"], g.units["carrier"]
+        self.assertEqual(g.carried_declared, ["missileA"])
+        self.assertEqual(g.missile_state(m), "carried")
+        self.assertEqual((m.blood, m.color, m.pos), (0, "", 0))
+        self.assertEqual(m.detail.get("carrier"), "carrier")
+        self.assertIn("missileA", car.detail["carried"])
+        # 开局即可发射（不需要部署动作）
+        ok, why = g.launch_missile(car.id, m.id)
+        self.assertTrue(ok, why)
+        self.assertEqual(g.missile_state(m), "loitering")
+        self.assertEqual(m.color, car.color)
+        self.assertGreater(m.blood, 0)
+
+    def test_obj_0_and_dangling_car_do_not_create_ownership(self):
+        path = self.root / "units.json"
+        units = json.loads(path.read_text(encoding="utf-8"))
+        for unit in units:
+            unit["car"] = "Obj_0" if unit["id"] == "missileA" else "Obj_0"
+        for unit in units:
+            if unit["id"] == "missileB":
+                unit["car"] = "Obj_404"
+        path.write_text(json.dumps(units), encoding="utf-8")
+        g = self.game()
+        self.assertEqual(g.carried_declared, [])
+        self.assertEqual(g.carried_declare_unlinked, [("missileB", "Obj_404")])
+        for uid in ("missileA", "missileB"):
+            self.assertEqual(g.missile_state(g.units[uid]), "unassigned")
+            self.assertNotIn("carrier", g.units[uid].detail)
 
 
 class MissileScenarioTests(unittest.TestCase):
