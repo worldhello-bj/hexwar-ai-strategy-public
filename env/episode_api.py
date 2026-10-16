@@ -11,7 +11,8 @@ import json
 from engine.game import Unit
 from engine import scoring as _scoring
 from .hexwar_env import (ATTACK_SEC, CAPTURE_SEC, HIDE_SEC, LOAD_SEC,
-                         GRENADE_SEC, AREA_FIRE_SEC)
+                         GRENADE_SEC, AREA_FIRE_SEC, LAUNCH_SEC,
+                         own_units_for_projection)
 
 from .match_eval import SIDES, _SerialSession, _json_copy, _positive_int
 
@@ -139,8 +140,7 @@ class TwoPlayerEpisode:
                                   {id(authoritative.game.hexes): authoritative.game.hexes})
         # Build opposing tokens from the public whitelist, not copied private
         # ammunition, carrier state, equipment, targets, or hidden occupancy.
-        units = {uid: unit for uid, unit in projected.game.units.items()
-                 if unit.color == side}
+        units = own_units_for_projection(projected.game, side)
         for public in view["enemy_visible"]:
             unit = Unit(public)
             unit.stunned_until = (projected.game.second + 1
@@ -218,7 +218,8 @@ class TwoPlayerEpisode:
             # advance, preventing free hidden-state probes. No reason is exposed.
             costs = {"attack": ATTACK_SEC, "capture": CAPTURE_SEC,
                      "hide": HIDE_SEC, "load": LOAD_SEC, "unload": LOAD_SEC,
-                     "grenade": GRENADE_SEC, "area_fire": AREA_FIRE_SEC}
+                     "grenade": GRENADE_SEC, "area_fire": AREA_FIRE_SEC,
+                     "launch": LAUNCH_SEC}
             seconds = detached.get("seconds", costs.get(detached["type"], self._dt))
             env.step({"type": "wait", "seconds": max(1, seconds)})
         self._steps += 1

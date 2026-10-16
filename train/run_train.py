@@ -119,6 +119,29 @@ ALLOWED = {
 MODULE = {"mc": "env.selfplay", "ppo": "env.neural_train", "eval": "env.policy_eval",
           "run_episode": "env.run_episode", "diff": "tools.hex_env_diff"}
 
+# 检查点里 `algorithm` 字段的取值 → 用哪个评测器。两个加载器**互不兼容**：
+# `env.policy_eval`（SelfPlayTrainer）只认 MC 表，`env.neural_train`（NeuralTrainer）只认神经策略。
+MC_ALGO = "first_visit_terminal_mc"
+NEURAL_ALGOS = ("neural_terminal_reinforce_vs_random", "neural_terminal_ppo_clip_vs_random")
+
+
+def checkpoint_kind(path):
+    """检查点类型 → `'mc'`（查表）/ `'neural'`（神经策略）/ `None`（读不出来或不认识）。
+
+    文档里的 `ppo → eval` 流程在 PPO 检查点上曾直接报 `unsupported checkpoint`
+    （因为 eval 以前一律走 MC 评测器），所以这里**先判类型再分流**；判不出来就报错，不猜。
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            algo = json.load(fh).get("algorithm")
+    except (OSError, ValueError):
+        return None
+    if algo == MC_ALGO:
+        return "mc"
+    if algo in NEURAL_ALGOS:
+        return "neural"
+    return None
+
 
 def core_root():
     """定位"核心"（engine/ env/ tools/ scenario/ 所在目录），两种布局都支持。
@@ -263,8 +286,15 @@ def main():
             print("当前是「直接用仓库根」布局：train/ 里没有生成副本，无需同步检查。")
             print("（自包含副本由 tools/build_train_env.py 生成，那边跑 check 才有意义。）")
             return 0
-        return run([PY, os.path.join(core_root(), "tools", "build_train_env.py"),
-                    "--check"])
+        # ★ 必须用**主仓库根**的那份 build_train_env.py：它按自身位置推导
+        #   `ROOT = dirname(dirname(__file__))`、`TRAIN = ROOT/train`。
+        #   若调用 train/tools/ 里的副本，ROOT 会算成 `train/`、TRAIN 会算成
+        #   `train/train`（不存在）⇒ 永远误报「train/ 还没生成过」。
+        tool = os.path.join(REPO, "tools", "build_train_env.py")
+        if not os.path.isfile(tool):
+            print("train/ 是独立副本（外侧没有主仓库）：没有核心可比，漂移检查无从谈起。")
+            return 0
+        return run([PY, tool, "--check"])
 
     sub = {"env": "run_episode", "mc": "mc", "ppo": "ppo", "eval": "eval",
            "diff": "diff", "train": args.algo}[args.cmd]
@@ -283,7 +313,59 @@ def main():
     if sub in ("mc", "ppo") and not (cfg.get("checkpoint") or "--checkpoint" in extra):
         raise SystemExit("%s 需要 checkpoint（或在配置里给 checkpoint）" % sub)
     argv = to_argv(cfg) + extra
-    cmd = py_module(MODULE[sub], argv)
+    if sub == "eval":
+        ck = cfg.get("checkpoint")
+        if ck is None and "--checkpoint" in extra:
+            ck = extra[extra.index("--checkpoint") + 1]
+        kind = checkpoint_kind(os.path.join(HERE, str(ck))) if ck else None
+        if kind is None:
+            raise SystemExit(
+                "eval 需要 --checkpoint，且只认两类：MC 表（algorithm=%s）或神经策略\n"
+                "（%s）。读不到或不认识的检查点不猜 —— 先看该文件里的 algorithm 字段。"
+                % (MC_ALGO, " / ".join(NEURAL_ALGOS)))
+        if kind == "neural":
+            # 神经策略没有独立评测器：走 neural_train 的 --eval-only（与训练收尾同一个 evaluate()）。
+            # 配置给默认值，**命令行 `extra` 覆盖配置**（与其它子命令同一约定：后者胜），
+            # 键名按神经评测器的 CLI 翻译（配置里的 `seeds` → `--eval-seeds`）。
+            opts = {"checkpoint": str(ck),
+                    "snapshot": str(cfg.get("snapshot", DEFAULT_SCENARIO)),
+                    "report": str(cfg.get("report", "analysis/eval.json")),
+                    "allow_real_map": bool(cfg.get("allow_real_map")),
+                    "seeds": [str(s) for s in (cfg.get("seeds") or [])]}
+            i = 0
+            while i < len(extra):
+                token = extra[i]
+                if token in ("--checkpoint", "--snapshot", "--report"):
+                    if i + 1 >= len(extra):
+                        raise SystemExit("%s 需要一个值" % token)
+                    opts[token[2:]] = extra[i + 1]
+                    i += 2
+                elif token == "--allow-real-map":
+                    opts["allow_real_map"] = True
+                    i += 1
+                elif token == "--seeds":
+                    opts["seeds"] = []
+                    i += 1
+                    while i < len(extra) and not extra[i].startswith("--"):
+                        opts["seeds"].append(extra[i])
+                        i += 1
+                else:
+                    raise SystemExit(
+                        "eval 分发到神经评测器时收到不支持的参数 %r（神经评测只认 "
+                        "--checkpoint / --snapshot / --report / --seeds / --allow-real-map）"
+                        % token)
+            ensure_dirs(opts)                      # 覆盖后的输出目录也要建（--report 可能换目录）
+            argv = ["--eval-only", "--checkpoint", opts["checkpoint"],
+                    "--snapshot", opts["snapshot"], "--report", opts["report"]]
+            if opts["allow_real_map"]:
+                argv.insert(1, "--allow-real-map")
+            if opts["seeds"]:
+                argv += ["--eval-seeds"] + opts["seeds"]
+            cmd = [PY, "-m", "env.neural_train"] + argv
+        else:
+            cmd = py_module(MODULE["eval"], argv)
+    else:
+        cmd = py_module(MODULE[sub], argv)
     ensure_dirs(cfg)
     if args.dry_run:
         print("$ " + " ".join(cmd))

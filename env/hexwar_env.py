@@ -44,8 +44,33 @@ WAIT_SEC = 10          # 主动等待的默认时长
 LOAD_SEC = 30          # 上/下车
 GRENADE_SEC = 10       # 投掷手雷
 AREA_FIRE_SEC = 10     # 一次集火射击（手册 3.16）
+# 发射一枚巡飞弹的占用耗时（手册 4.10）。**平台未实测、手册也没给** —— 明确标成
+# 占位值，不冒充实测值；规则效果（消耗 / 在飞占用 / 释放 / 计时）都不依赖这个数。
+LAUNCH_SEC = 10
 # 手册未给出单车载员数，此处按堆叠上限（手册 4.2）假定为 4
 VEHICLE_SEATS = 4
+
+
+def own_units_for_projection(game, side):
+    """投影枚举时要保留的「本方单位」：己方在编 **加上己方车内单位**。
+
+    车内记录（`color` 为空、`pos=0`、`blood=0`）不是独立行动单位，但
+    `load` / `launch` 这类动作的**主体或宾语**可能就是它（弹在载车的载员表里），
+    所以投影必须带上它们：否则 `legal_actions` 里 `g.units.get(missile_id)` 会落空，
+    「发射巡飞弹」这个动作永远生成不出来。
+
+    平台侧同样不下发车内记录（`ObjAjax` 里恒为 0 条），玩家靠载具的 `carrying`
+    才看得到它们的 id —— 与这里的口径一致。
+    """
+    out = {}
+    for uid, unit in game.units.items():
+        if unit.color == side:
+            out[uid] = unit
+            continue
+        host = game.units.get(unit.detail.get("carrier"))
+        if host is not None and host.color == side:
+            out[uid] = unit
+    return out
 
 
 class HexwarEnv:
@@ -134,6 +159,18 @@ class HexwarEnv:
                 "weapons": [self._weapon_view(u, wid) for wid in u.wz],
                 "can_observe_range": self._observe_range(u),
             })
+            # 巡飞弹生命周期显式暴露（issue #1）：状态 + 载车/发射车 + 剩余巡飞秒。
+            # 车内记录 `blood=0`、无阵营 ⇒ 不会出现在 `own` 里；但载具的 `carrying`
+            # 列出它的 id，所以通过 `load`/`launch` 仍是可发现的。
+            if u.is_loitering_missile():
+                d["missile_state"] = self.game.missile_state(u)
+                if u.detail.get("loiter_until"):
+                    d["loiter_seconds_left"] = max(
+                        0, int(u.detail["loiter_until"] - self.game.second))
+            if u.typeid == 2:
+                in_flight = self.game.in_flight_missile(u.id)
+                if in_flight is not None:
+                    d["missile_in_flight"] = in_flight.id
         return d
 
     @staticmethod
@@ -229,6 +266,12 @@ class HexwarEnv:
     # ---------------- 动作空间 ----------------
     # 不需要引擎裁决、可以纯只读判定的动作类型（它们不会改变任何状态或掷骰）
     READONLY_TYPES = ("move", "wait", "stop", "stop_attack")
+    # 会改变状态、但“此刻能不能做”只由**当场可读**的条件决定（无需试一次、也无需掷骰）。
+    # 为什么单列：事务校验会为**每一个候选项**复制整个 `Game`，真实地图上实测
+    # ~3.4 ms/次；实时接口（1 Hz、每秒 2 次枚举）下 hide/load 就有 21 个候选，
+    # 占满整次枚举 78% 的耗时。这里的判定逐条照抄 `_apply` 的条件，
+    # `_apply` 仍是权威（非法项会被它拒绝）。
+    CHEAP_TYPES = ("hide", "load", "grenade")
 
     def legal_actions(self, unit_id=None, move_radius=None, deep_validate=None):
         """列出当前合法动作。
@@ -315,14 +358,23 @@ class HexwarEnv:
             if not self._in_attack_gap(u):
                 acts.append({"type": "hide", "unit": u.id,
                              "on": 0 if u.ste == 2 else 1})
-            # 上车（手册 3.3）：人员与车辆同格
-            if u.typeid == 1:
+            # 上车（手册 3.3）：人员与车辆同格；巡飞弹同一条路径（平台走同一个
+            # `com/ObjInto.asp`，手册 4.10(3) 的“对抗开始前上车”由 `_load_gate` 把关）。
+            if u.typeid == 1 or u.is_loitering_missile():
                 for c in g.units.values():
                     if (c.alive() and c.typeid == 2 and c.color == u.color
                             and c.pos == u.pos and not c.stunned(g.second)
                             and not c.detail.get("carrier")
                             and self._seat_left(c) > 0):
                         acts.append({"type": "load", "unit": u.id, "carrier": c.id})
+            # 发射巡飞弹（手册 4.10(3)(4)）：由**载车**下令，弹必须在该车车内，
+            # 且该车当前没有在飞弹。真正的合法性由 `_try_actions` 事务校验裁决。
+            if u.typeid == 2:
+                for mid in sorted(u.detail.get("carried") or [], key=str):
+                    m = g.units.get(mid)
+                    if m is not None and m.is_loitering_missile():
+                        acts.append({"type": "launch", "unit": u.id,
+                                     "missile": m.id})
             # 下车（手册 3.3）：由车辆下达
             if u.typeid == 2 and u.detail.get("carried"):
                 acts.append({"type": "unload", "unit": u.id})
@@ -362,13 +414,14 @@ class HexwarEnv:
         return self._fast_actions(acts)
 
     def _cheap_ok(self, act):
-        """只读判定：只允许用于 `READONLY_TYPES`。
+        """只读 / 廉价判定：只允许用于 `READONLY_TYPES` 与 `CHEAP_TYPES`。
 
         - `wait` / `stop` / `stop_attack`：事务校验不会拒。注意 `wait` **故意豁免**
           剩余时间上限——`_try_actions` 的时间检查只在非 wait 分支里，超时的等待
           会被截断到剩余秒（这样时钟才能正好走到 `max_seconds`）。
         - `move`：BFS 已经按 `step_seconds > 0` 逐跳筛过（通行/坡度/压制/堆叠），
           唯一漏掉的是**冲锋疲劳**（见 `legal_actions` 的说明）。
+        - `hide` / `load`：会改变状态，但合法性只依赖当场可读的条件，见 `_cheap_ok_stateful`。
         """
         try:
             self._validate(act)
@@ -376,6 +429,8 @@ class HexwarEnv:
             return False
         g = self.game
         kind = act["type"]
+        if kind in self.CHEAP_TYPES:
+            return self._cheap_ok_stateful(act)
         if kind not in self.READONLY_TYPES:
             raise ValueError("cheap check is only valid for readonly action types")
         if kind in ("wait", "stop", "stop_attack"):
@@ -386,11 +441,31 @@ class HexwarEnv:
             return False
         return math.ceil(act.get("seconds", self.dt)) <= self.max_seconds - g.second
 
+    def _cheap_ok_stateful(self, act):
+        """`hide` / `load` / `grenade` 的廉价判定（逐条对应 `_apply` 里的条件）。"""
+        g = self.game
+        kind = act["type"]
+        u = g.units.get(act["unit"])
+        if u is None:
+            return False
+        cost = {"hide": HIDE_SEC, "load": LOAD_SEC, "grenade": GRENADE_SEC}[kind]
+        if math.ceil(cost) > self.max_seconds - g.second:
+            return False
+        if kind == "hide":
+            return not self._in_attack_gap(u)
+        if kind == "grenade":
+            # `_validate` 已保证 u 为己方存活且未上车/未被压制，target_hex 是存在的格
+            return (144 in u.wz and u.ammo.get("a5", 0) > 0
+                    and G.distance(u.pos, int(act["target_hex"])) <= 1)
+        car = g.units.get(act.get("carrier"))
+        return self._load_gate(u, car)[0]
+
     def _fast_actions(self, acts):
-        """快速枚举过滤：只读类型走 `_cheap_ok`，其余仍走事务校验。"""
+        """快速枚举过滤：只读类型与 hide/load 走 `_cheap_ok`，其余仍走事务校验。"""
+        cheap = set(self.READONLY_TYPES) | set(self.CHEAP_TYPES)
         out = []
         for a in acts:
-            if a["type"] in self.READONLY_TYPES:
+            if a["type"] in cheap:
                 if self._cheap_ok(a):
                     out.append(a)
             elif self._try_actions([a], commit=False)[0]:
@@ -409,7 +484,7 @@ class HexwarEnv:
                 raise ValueError("wait seconds must be a positive integer")
             return
         if kind not in {"move", "attack", "stop_attack", "area_fire", "capture",
-                        "hide", "load", "unload", "grenade", "stop"}:
+                        "hide", "load", "unload", "grenade", "stop", "launch"}:
             raise ValueError("unknown action type")
         g = self.game
         u = g.units.get(act.get("unit"))
@@ -438,10 +513,20 @@ class HexwarEnv:
             raise ValueError("hide on must be 0 or 1")
         if kind == "load":
             car = g.units.get(act.get("carrier"))
-            if (u.typeid != 1 or u.detail.get("carrier") or not car or
-                    car.id == u.id or car.color != self.side or car.typeid != 2 or
-                    car.detail.get("carrier")):
+            if not car or car.id == u.id:
+                raise ValueError("load requires another unit as carrier")
+            if u.is_loitering_missile():
+                # 手册 4.10(3)：巡飞弹上车 = 部署，载体必须是己方**车辆**。
+                if car.typeid != 2 or car.color != self.side:
+                    raise ValueError("a loitering missile must deploy onto an own vehicle")
+            elif (u.typeid != 1 or u.detail.get("carrier") or car.color != self.side
+                  or car.typeid != 2 or car.detail.get("carrier")):
                 raise ValueError("load requires own infantry and own vehicle")
+        if kind == "launch":
+            # 手册 4.10：发射由**载车**下令（`unit` = 载车，`missile` = 弹）。
+            m = g.units.get(act.get("missile"))
+            if u.typeid != 2 or m is None or m.id == u.id:
+                raise ValueError("launch requires a vehicle and a missile to launch")
         if kind == "unload" and (u.typeid != 2 or not u.detail.get("carried")):
             raise ValueError("unload requires a loaded vehicle")
         if kind in ("area_fire", "grenade"):
@@ -526,6 +611,38 @@ class HexwarEnv:
         self._remember()
         self._check_done()
         return self.observe(), float(self.score()["diff"] - before), self.done, info
+
+    def _load_gate(self, u, car):
+        """`load` 的合法性判定（`_apply` 与 `_cheap_ok_stateful` **共用同一条口径**）。
+
+        返回 `(ok, why)`。**纯读取**，不改状态 —— `_cheap_ok_stateful`（枚举用）依赖这一点。
+        巡飞弹的部署规则**不在环境里重复实现**，而是调 `engine` 的纯判定
+        （`Game.missile_deploy_block`），避免两份判定漂移。
+        """
+        g = self.game
+        if car is None or car.id == u.id:
+            return False, "载具不存在"
+        if u.is_loitering_missile():
+            # 手册 4.10(3)：巡飞弹只能上车（部署）；具体状态机在引擎。
+            why = g.missile_deploy_block(car.id, u.id)
+            if why:
+                return False, why
+        else:
+            if u.typeid != 1:
+                return False, "只有人员与巡飞弹可以上车"
+            if car.typeid != 2:
+                return False, "载具必须是车辆"
+        if car.color != u.color or car.color != self.side:
+            return False, "载具必须是己方单位"
+        if not car.alive():
+            return False, "载具已被消灭"
+        if car.pos != u.pos:
+            return False, "人与车必须同格（手册 3.3）"
+        if u.stunned(g.second) or car.stunned(g.second):
+            return False, "被压制不能上/下车（手册 4.6.3(1)）"
+        if self._seat_left(car) <= 0:
+            return False, "载员已满"
+        return True, ""
 
     def _apply(self, act):
         g = self.game
@@ -622,15 +739,15 @@ class HexwarEnv:
             return None, 0.0, False, {"msg": "掩蔽切换", "seconds": HIDE_SEC}
         if t == "load":
             car = g.units.get(act.get("carrier"))
-            if not car or not car.alive():
-                return None, 0.0, False, {"msg": "载具不存在", "seconds": 0}
-            if car.pos != u.pos:
-                return None, 0.0, False, {"msg": "人与车必须同格（手册 3.3）", "seconds": 0}
-            if u.stunned(g.second) or car.stunned(g.second):
-                return None, 0.0, False, {
-                    "msg": "被压制不能上/下车（手册 4.6.3(1)）", "seconds": 0}
-            if self._seat_left(car) <= 0:
-                return None, 0.0, False, {"msg": "载员已满", "seconds": 0}
+            ok, why = self._load_gate(u, car)
+            if not ok:
+                return None, 0.0, False, {"msg": why, "seconds": 0}
+            if u.is_loitering_missile():
+                # 上车 = **部署**（手册 4.10(3)），状态转换由引擎独占实现。
+                ok, why = g.deploy_missile(car.id, u.id)
+                if not ok:
+                    return None, 0.0, False, {"msg": why, "seconds": 0}
+                return None, 0.0, False, {"msg": "巡飞弹部署上车", "seconds": LOAD_SEC}
             # ★ 平台实测（`docs/运输机制实测.md` + `tools/hex_load_kill_probe.py`）：
             #   上车后该单位变成 `blood=0 / color=''`（车内读不到兵力与阵营），**编制留在 establishment**，
             #   平台按编制把它计入剩余兵力分；下车时**新建实体、blood = 编制、color = 载具那方**。
@@ -674,9 +791,21 @@ class HexwarEnv:
                 p.pos = u.pos
                 p.pos2 = u.pos
                 p.detail.pop("carrier", None)
+                if p.is_loitering_missile():
+                    # ★ 「人员卸载不发射巡飞弹」：卸载只是把弹**取回**（未发射）——
+                    #   回到 `unassigned`；发射只能由显式的 `launch` 动作发生。
+                    p.detail.pop("missile_state", None)
                 out.append(p.id)
             u.detail["carried"] = []
             return None, 0.0, False, {"msg": "下车 %d 个" % len(out), "seconds": LOAD_SEC}
+        if t == "launch":
+            # 手册 4.10(3)(4)：由载车发射；状态机（在飞占用/一车一枚/超时）在引擎里。
+            ok, why = g.launch_missile(u.id, act.get("missile"))
+            if not ok:
+                return None, 0.0, False, {"msg": "发射失败：%s" % why, "seconds": 0}
+            return None, 0.0, False, {
+                "msg": "巡飞弹已发射，巡飞上限 %s 秒" % g.loiter_sec,
+                "seconds": LAUNCH_SEC}
         if t == "grenade":
             res, err = g.grenade(u.id, int(act.get("target_hex") or u.pos))
             if err:

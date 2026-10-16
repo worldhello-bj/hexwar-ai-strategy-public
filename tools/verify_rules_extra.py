@@ -151,35 +151,77 @@ if ugv and cv:
 else:
     check("存在无人战车与车辆", False, "无 UGV/车辆")
 
-print("\n== 4.10 巡飞弹：部署 / 一车一枚 / 超时自毁 / 发射车被毁自毁 ==")
-msl = next((x for x in g.units.values() if x.is_loitering_missile()), None)
-cv2 = veh()
-if msl and cv2:
-    msl.blood = 1
-    msl.detail["carrier"] = cv2.id
-    cv2.blood = 1
-    ok, why = g.launch_missile(cv2.id, msl.id)
-    check("部署在该车上 → 可发射（手册 4.10(3)）", ok, why)
-    check("发射后巡飞弹落在发射车所在格", msl.pos == cv2.pos)
-    ok2, why2 = g.launch_missile(cv2.id, msl.id)
-    check("一车一次只能发射一枚（手册 4.10(4)）", not ok2, why2)
-    # 超时自毁
-    msl.blood = 1
-    g.advance(g.LOITER_SEC + 1)
-    check("巡飞超时自毁（手册 4.10(5)）", not msl.alive(), "血量=%d" % msl.blood)
-    # 发射车被毁 → 自毁
-    msl2 = next((x for x in g.units.values()
-                 if x.is_loitering_missile() and x.id != msl.id), None)
-    if msl2 and cv2:
-        msl2.blood = 1
-        msl2.detail["carrier"] = cv2.id
-        cv2.detail.pop("launched_missile", None)
-        g.launch_missile(cv2.id, msl2.id)
-        cv2.blood = 0
-        g.advance(1)
-        check("发射车被摧毁 → 巡飞弹自毁（手册 4.10(5)）", not msl2.alive())
+print("\n== 4.10 巡飞弹：生命周期（部署 / 在飞占用 / 消耗 / 超时 / 载车被毁） ==")
+# 用**全新**的一局：`deploy_missile` 只接受「对抗开始前」（`second == 0`，手册 4.10(3)），
+# 而上面的用例已经把 `g` 的时钟推进过了。
+gm = Game(seed=7)
+gm.start()
+msls = sorted((x for x in gm.units.values() if x.is_loitering_missile()),
+              key=lambda x: str(x.id))
+car = next((x for x in sorted(gm.units.values(), key=lambda x: str(x.id))
+            if x.typeid == 2 and x.pos == msls[0].pos and x.color), None)
+if len(msls) == 3 and car is not None:
+    check("想定初态的巡飞弹与载车同格、但**未建立所属关系**（`unassigned`）",
+          all(gm.missile_state(m) == "unassigned" and not m.detail.get("carrier")
+              and not m.detail.get("launcher") for m in msls))
+    check("初态不凭同格/武器 76 静默推断已发射（无 `launched_missile` 占用）",
+          all(not x.detail.get("launched_missile") for x in gm.units.values()))
+    ok, why = gm.launch_missile(car.id, msls[0].id)
+    check("未部署上车不能发射（手册 4.10(3)）", not ok and "4.10(3)" in why, why)
+    ok, why = gm.deploy_missile(car.id, msls[1].id)
+    check("不同格的弹不能装到这辆车上（手册 3.3）", not ok and "同格" in why, why)
+    ok, why = gm.deploy_missile(car.id, msls[0].id)
+    check("对抗开始前可部署上车（手册 4.10(3)）", ok, why)
+    check("部署后显式状态 = `carried`，且车内读不到兵力/阵营",
+          gm.missile_state(msls[0]) == "carried" and msls[0].blood == 0
+          and not msls[0].color, "blood=%s color=%r" % (msls[0].blood, msls[0].color))
+    old_second = gm.second
+    gm.second = 5
+    ok, why = gm.deploy_missile(car.id, msls[1].id)
+    check("对抗开始**之后**不能再上车（手册 4.10(3)）", not ok, why)
+    gm.second = old_second
+    gm.started = False
+    ok, why = gm.launch_missile(car.id, msls[0].id)
+    check("对抗开始前不能发射（手册 4.10(3)）", not ok and "开始前" in why, why)
+    gm.started = True
+    ok, why = gm.launch_missile(car.id, msls[0].id)
+    check("车内 blood=0 也能发射（不再被 alive 门拦）", ok, why)
+    check("发射后恢复阵营与编制兵力、状态 = `loitering`",
+          msls[0].color == car.color and msls[0].blood > 0
+          and gm.missile_state(msls[0]) == "loitering")
+    check("发射后弹落在载车所在格", msls[0].pos == car.pos)
+    check("发射把弹从载车 carrying 移出（不能重复发射/重复卸载）",
+          msls[0].id not in (car.detail.get("carried") or []))
+    check("载车记录在飞占用（`launched_missile` + `stop=1`）",
+          car.detail.get("launched_missile") == msls[0].id and car.detail.get("stop") == 1)
+    check("发射时记录巡飞上限与取值来源",
+          msls[0].detail.get("loiter_seconds") == gm.loiter_sec
+          and bool(msls[0].detail.get("loiter_seconds_source")))
+    ok, why = gm.launch_missile(car.id, msls[0].id)
+    check("同一辆车不能对同**一枚**弹重复发射", not ok, why)
+    # 第二枚：先摆到同一格再上车（这一步只是测试摆位，不代表规则允许跳格装载）
+    msls[1].pos = car.pos
+    msls[1].pos2 = car.pos
+    ok, why = gm.deploy_missile(car.id, msls[1].id)
+    check("同格的第二枚弹可以上车", ok, why)
+    ok, why = gm.launch_missile(car.id, msls[1].id)
+    check("同车已有在飞弹 → 拒绝第二枚（手册 4.10(4)）", not ok and "在飞" in why, why)
+    # 第一枚超时后释放占用 —— 且**不是**“一局一枚”的永久锁
+    gm.advance(gm.loiter_sec + 1)
+    check("巡飞超时自毁（手册 4.10(5)）", not msls[0].alive()
+          and gm.missile_state(msls[0]) == "lost", "血=%d" % msls[0].blood)
+    check("超时释放载车占用（原实现是永久锁：第二枚永远发不出去）",
+          not car.detail.get("launched_missile") and car.detail.get("stop") == 0)
+    ok, why = gm.launch_missile(car.id, msls[1].id)
+    check("释放后可发射另一枚合法可用弹（手册 4.10(4) 是“同时一枚”）", ok, why)
+    car.blood = 0
+    gm.advance(1)
+    check("发射车被摧毁 → 在飞弹自毁（手册 4.10(5)）", not msls[1].alive()
+          and gm.missile_state(msls[1]) == "lost")
+    check("已损失的弹不能复活（再次发射被拒）",
+          not gm.launch_missile(car.id, msls[1].id)[0])
 else:
-    check("存在巡飞弹与车辆", False, "无巡飞弹/车辆")
+    check("存在 3 枚巡飞弹与同格载车", False, "巡飞弹 %d 枚 / 载车 %s" % (len(msls), car))
 
 print("\n" + "=" * 60)
 print("新增规则验证：%d/%d 通过" % (len(PASS), len(PASS) + len(FAIL)))

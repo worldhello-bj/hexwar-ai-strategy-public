@@ -29,6 +29,26 @@ FATIGUE_SEC = 60
 # 夺控判定所需兵力
 CAPTURE_MIN_BLOOD = 1
 
+# ---------------- 巡飞弹生命周期常量（手册 4.10 / issue #1） ----------------
+# 巡飞超时上限：手册 4.10(5) 只说"超时自毁"，**未给数值**。平台取值有代码级证据
+# （`offline/assets/war.min.js`）：
+#     FlyTime = parseInt(1200 / RoomSpeed)
+#     巡飞计时 = parseInt((new Date(ServerTime) - new Date(radar)) / 1000)   # 秒
+#     计时 >= FlyTime → CommandKill(弹)，并把弹的 `car`（载车）的 `stop` 清 0
+# ⇒ "巡飞上限 = 1200 / RoomSpeed 秒"，且这里的"秒"与 `ServerTime` 差值同尺度
+#   （客户端每秒轮询一次、`RoomSecond` 每秒 +1，与本引擎 `Game.second` 同尺度）。
+# ⚠️ **仍未确证**：真实发射后服务端下发的 `radar`/`car` 取值，以及 RoomSpeed 与
+#   `RoomSecond` 的换算。已知的先例是「房间时长 × RoomSpeed」
+#   （`KeepSec 50 × RoomSpeed 3 = SUPPRESS_SEC 150`），与 FlyTime 的**除法方向相反**
+#   ⇒ 两者是否同一口径没有实测样本。所以这里**不写死 1200**：默认按客户端公式算
+#   （RoomSpeed=3 → 400 秒），允许显式覆盖，并把每个在飞弹的取值与来源记进 `detail`。
+LOITER_ROOM_UNITS = 1200        # 客户端 FlyTime 的分子
+DEFAULT_ROOM_SPEED = 3          # 练习服/比赛服实测 RoomSpeed（`User_Get[16]`）
+LOITER_SEC_PLACEHOLDER = 120    # 早前的无来源占位值，保留仅作对照（不再是默认）
+
+# 巡飞弹的显式生命周期状态（见 `Game.missile_state`）。
+MISSILE_STATES = ("unassigned", "carried", "loitering", "spent", "lost")
+
 
 class Unit:
     __slots__ = ("id", "data", "name", "army", "group", "typeid", "color", "pos",
@@ -88,6 +108,17 @@ class Unit:
         icons = [x for x in str(d.get("son") or "").split(",") if x]
         if icons:
             self.detail["son_icons"] = icons
+        # 手册 4.10 巡飞弹 / 装卸的**原始生命周期字段**：`car`（所属载具）与 `stop`
+        # （载车的"在飞占用"标志）。原实现直接丢弃 ⇒ 生命周期只能靠猜（issue #1 第 5 条）。
+        # 这里只**保留证据**，不做任何静默推断，且"无值"不写进 detail：
+        # 平台里 `car=Obj_0` 就是"没有载车"、`stop=0` 就是"没有在飞占用"；
+        # 想定 7527 的 36 个单位全都是 `car=Obj_0` ⇒ 不能凭"同格"或"武器 76"推断已部署。
+        car = str(d.get("car") or "")
+        if car and car != "Obj_0":
+            self.detail["car"] = car
+        stop = int(d.get("stop") or 0)
+        if stop:
+            self.detail["stop"] = stop
 
     # --- 单位类别（手册 4.8 / 4.9 / 4.10）---
     def is_air(self):
@@ -136,8 +167,25 @@ class Unit:
 class Game:
     """一局推演。完全本地，无外部依赖。"""
 
-    def __init__(self, seed=None, snapshot=None):
+    def __init__(self, seed=None, snapshot=None, room_speed=None, loiter_sec=None):
+        if room_speed is not None and (isinstance(room_speed, bool)
+                                       or not isinstance(room_speed, (int, float))
+                                       or room_speed <= 0):
+            raise ValueError("room_speed must be a positive number")
+        if loiter_sec is not None and (isinstance(loiter_sec, bool)
+                                       or not isinstance(loiter_sec, (int, float))
+                                       or loiter_sec <= 0):
+            raise ValueError("loiter_sec must be a positive number")
         self.rng = random.Random(seed)
+        # 巡飞超时上限（秒）：默认按客户端公式 `parseInt(1200 / RoomSpeed)` 算，
+        # 允许显式覆盖；取值与来源逐弹记进 `detail`（**不假装已实测**）。
+        self.room_speed = DEFAULT_ROOM_SPEED if room_speed is None else room_speed
+        if loiter_sec is None:
+            self.loiter_sec = self.loiter_seconds(self.room_speed)
+            self.loiter_sec_source = "client:parseInt(1200/RoomSpeed)"
+        else:
+            self.loiter_sec = loiter_sec
+            self.loiter_sec_source = "explicit override"
         snap = snapshot or SNAP
         self.snap_dir = snap
         self.hexes = {}
@@ -232,25 +280,44 @@ class Game:
         self.start_str = self.now_str()
         return True
 
-    def tick(self):
-        if not self.started:
-            return
-        self.second = int(time.time() - self.t0)
-        self.resolve_engagements()  # 手册 3.14 已设定目标的棋子自动持续打击
-        self.same_hex_engage()      # 手册 4.11 同格交战自动裁决
+    def tick_second(self):
+        """推进 **1 秒**，并按**秒**粒度结算所有自动规则。
+
+        这是与官方一致的粒度：服务端每秒刷新一次（`ObjAjax` / `User_Get`），
+        玩家每一秒都能观察 / 下令 / 改令。`advance()` 与 `tick()` 都必须**逐秒**走这一函数——
+        否则自动裁决次数会取决于"调用了几次"而不是"过了几秒"。
+
+        实测（同一段 60 秒、同一个持续打击目标）：
+        逐秒推进打出 **41** 发直瞷裁决，一次跳 60 秒只打出 **3** 发。
+        """
+        self.second += 1
+        self.t0 = time.time() - self.second
+        self.resolve_engagements()  # 手册 3.14 持续打击（内部按 ATTACK_INTERVAL_SEC 门控）
+        self.same_hex_engage()      # 手册 4.11 同格交战（内部按 ENGAGE_INTERVAL_SEC 门控）
         self._expire_states()
+        return self.second
+
+    def tick(self):
+        """实时时钟：把推演推进到真实经过的秒数（**逐秒**结算，不是一次算完）。"""
+        if not self.started:
+            return self.second
+        target = int(time.time() - self.t0)
+        while self.second < target:
+            self.tick_second()
+        return self.second
 
     def advance(self, seconds):
-        """把推演时钟向前推进若干秒（供无头模拟/策略搜索使用，与真实时钟无关）。"""
+        """把推演时钟向前推进若干秒（供无头模拟/策略搜索使用，与真实时钟无关）。
+
+        ★ **逐秒推进**：`advance(N)` 必须与 `advance(1)×N` 完全等价，
+        否则“把动作拆碎”就能多换自动裁决（实测 41 发 vs 3 发）——那是可以刷分的偏差。
+        """
         if isinstance(seconds, bool) or not isinstance(seconds, (int, float)) or not math.isfinite(seconds):
             raise ValueError("seconds must be a finite number")
         if seconds <= 0:
             return self.second
-        self.second += seconds
-        self.t0 = time.time() - self.second
-        self.resolve_engagements()  # 手册 3.14 已设定目标的棋子自动持续打击
-        self.same_hex_engage()      # 手册 4.11 同格交战自动裁决
-        self._expire_states()
+        for _ in range(int(math.ceil(seconds))):
+            self.tick_second()
         return self.second
 
     def _expire_states(self):
@@ -282,6 +349,7 @@ class Game:
             return False, "棋子不存在"
         u.detail["path"] = [int(x) for x in path]
         u.detail["path_idx"] = 0
+        u.detail["move_until"] = 0          # 新指令：清掉上一条路径遗留的到达时刻
         return True, ""
 
     def pending_moves(self):
@@ -294,6 +362,11 @@ class Game:
         if i >= len(path):
             u.detail.pop("path", None)
             u.detail.pop("path_idx", None)
+            u.detail.pop("move_until", None)
+            return
+        # ★ 按**秒**推进：本格还没走完就不动。缺这道门，推进速度会变成
+        #   “每个调用一格”（实测 60 秒里 60 次调用走 8 格，而规则是 60 秒/格）。
+        if now < u.detail.get("move_until", 0):
             return
         to_id = path[i]
         sec, why = self.step_seconds(u, u.pos, to_id)
@@ -303,6 +376,7 @@ class Game:
             self.record("%s 无法继续机动：%s" % (u.army or u.name, why))
             u.detail.pop("path", None)
             u.detail.pop("path_idx", None)
+            u.detail.pop("move_until", None)
             return
         u.pos = to_id
         u.detail["move_until"] = now + sec
@@ -325,23 +399,161 @@ class Game:
                 u.detail["out_of_control"] = True
                 self.record("%s 依托的有人战车 %s 被摧毁，失去控制（手册 4.9(3)）"
                             % (u.army or u.name, cid))
+        # 手册 4.10(5)：载车被摧毁时，仍**在车内**（尚未发射）的巡飞弹随之损失。
+        # 显式置 `lost`：否则它会保持 `carried` 状态，看上去“还能发射”（不复活）。
+        for u in self.units.values():
+            if not u.is_loitering_missile() or self.missile_state(u) != "carried":
+                continue
+            c = self.units.get(u.detail.get("carrier"))
+            if c is None or not c.alive():
+                u.detail["missile_state"] = "lost"
+                self.record("载车被摧毁，车内巡飞弹 %s 损失（手册 4.10(5)）" % u.id)
 
-    def launch_missile(self, carrier_id, missile_id):
-        """手册 4.10(3)(4)：巡飞弹由所属车辆发射；一车一次只能发射一枚。"""
+    # ---------------- 手册 4.10 巡飞弹生命周期（issue #1） ----------------
+    def missile_state(self, m):
+        """巡飞弹的显式生命周期状态（`engine.game.MISSILE_STATES` 之一）。
+
+        | 状态 | 含义 | 依据 |
+        |---|---|---|
+        | `unassigned` | 在图上、与载车**没有**所属关系（想定 7527 初态全是这种：36 个单位都是 `car=Obj_0`） | 手册 4.10(3) |
+        | `carried` | 已在载车内（`detail["carrier"]`；车内读不到兵力 ⇒ `blood=0`、阵营为空） | 平台装卸实测 |
+        | `loitering` | 已发射、在飞（`detail["launcher"]`） | 手册 4.10(4) |
+        | `spent` | 已完成一次攻击并消耗（负责人 2026-10-16 确认：攻击后巡飞弹消失） | 负责人确认 |
+        | `lost` | 已损失（巡飞超时自毁 / 载车被毁 / 外部击杀） | 手册 4.10(5) |
+
+        状态优先取 `detail["missile_state"]`（显式记录），缺记录时推导。
+        ★ 判据顺序很重要：**先看载车、再看血量** —— 车内记录 `blood=0` 是“车内读不到兵力”，
+        不是“已损失”（装卸上已经踩过一次这个坑）。所以 `carrier` + `blood=0` = `carried`。
+        """
+        state = m.detail.get("missile_state")
+        if state in ("spent", "lost"):
+            return state
+        if m.blood <= 0 and not m.detail.get("carrier"):
+            # 血量归零 = 已经不在图上（车内记录 blood=0 是例外：那是“车内读不到兵力”）。
+            return "lost"
+        if state in MISSILE_STATES:
+            return state
+        if m.detail.get("launcher"):
+            return "loitering"
+        if m.detail.get("carrier"):
+            return "carried"
+        return "unassigned"
+
+    def in_flight_missile(self, carrier_id):
+        """该载车当前**在飞**的巡飞弹（没有则 None）。**纯查询，不修改状态。**"""
+        c = self.units.get(carrier_id)
+        if c is None:
+            return None
+        m = self.units.get(c.detail.get("launched_missile"))
+        if m is None or self.missile_state(m) != "loitering":
+            return None
+        return m
+
+    def release_launcher(self, carrier_id):
+        """解除载车的“在飞占用”（`stop` 归零），使该车可再次发射。
+
+        手册 4.10(4) 的约束是“**同时**只能有一枚在飞”，不是“一局一枚”
+        （issue #1 第 3 条：原实现的 `launched_missile` 是永久锁）。
+        """
+        c = self.units.get(carrier_id)
+        if c is None:
+            return
+        c.detail.pop("launched_missile", None)
+        if c.detail.get("stop"):
+            c.detail["stop"] = 0
+
+    def missile_deploy_block(self, carrier_id, missile_id):
+        """部署巡飞弹的**纯**规则前置条件（不修改任何状态）。
+
+        返回 `None` 表示允许，否则返回拒绝原因。`deploy_missile()` 与环境的**只读**枚举
+        （`HexwarEnv._load_gate`）共用同一条口径，避免两份判定漂移。
+        """
         c = self.units.get(carrier_id)
         m = self.units.get(missile_id)
-        if not c or not m or not c.alive() or not m.alive():
-            return False, "单位不存在或已损失"
+        if not c or not m:
+            return "单位不存在"
+        if not m.is_loitering_missile():
+            return "该棋子不是巡飞弹"
+        state = self.missile_state(m)
+        if state != "unassigned":
+            return "巡飞弹当前状态为 %s，不能部署上车" % state
+        if not self.started:
+            return "对抗尚未开始"
+        if self.second != 0:
+            return "巡飞弹须在对抗开始前上车（手册 4.10(3)）"
+        if not c.alive():
+            return "载车已被消灭"
+        if c.typeid != 2:
+            return "巡飞弹只能部署在车辆上"
+        if not c.color or c.color != m.color:
+            return "巡飞弹只能部署在己方车辆上"
+        if c.pos != m.pos:
+            return "巡飞弹与载车必须同格（手册 3.3）"
+        if c.stunned(self.second) or m.stunned(self.second):
+            return "被压制不能上/下车（手册 4.6.3(1)）"
+        return None
+
+    def deploy_missile(self, carrier_id, missile_id):
+        """手册 4.10(3)：巡飞弹须在**对抗开始前**上车以确定所属关系。
+
+        显式转换 `unassigned → carried`，**不做任何静默推断**（同格、`son` 图标、
+        武器 76 都不构成“已部署/已发射”的证据）。已发射、已消耗、已损失的弹一律
+        拒绝 —— 不复活。想定 7527 的三枚弹初态就是 `unassigned`（`car=Obj_0`）。
+        """
+        c = self.units.get(carrier_id)
+        m = self.units.get(missile_id)
+        block = self.missile_deploy_block(carrier_id, missile_id)
+        if block:
+            return False, block
+        m.detail["carrier"] = c.id
+        c.detail.setdefault("carried", []).append(m.id)
+        # 与人员上车同理：车内读不到兵力与阵营（平台实测），编制留在 `establishment`。
+        m.establishment = m.establishment or m.blood
+        m.blood = 0
+        m.color = ""
+        m.detail["missile_state"] = "carried"
+        self.record("%s 部署巡飞弹 %s（手册 4.10(3)）" % (c.army or c.name, m.id))
+        return True, ""
+
+    def launch_missile(self, carrier_id, missile_id):
+        """手册 4.10(3)(4)：由所属车辆发射；该车**同时只能有一枚在飞**。
+
+        与原实现的三处差别（issue #1）：
+
+        1. **不再用“一局一枚”的永久标记** —— 占用由 `in_flight_missile()` 判定，
+           弹一被消耗 / 自毁 / 载车被毁即释放（原实现的 `launched_missile` 永不清除）。
+        2. **不再用 `alive()` 拦车内弹** —— 车内 `blood=0` 是“车内读不到兵力”，不是
+           “已损失”；“已损失不能复活”改由**显式生命周期状态**判定。
+        3. **必须 `self.started`** —— 手册 4.10(3)：开始后才能发射（原实现在开局前也放行）。
+        """
+        c = self.units.get(carrier_id)
+        m = self.units.get(missile_id)
+        if not c or not m:
+            return False, "单位不存在"
         if not m.is_loitering_missile():
             return False, "该棋子不是巡飞弹"
+        if not self.started:
+            return False, "对抗开始前不能发射巡飞弹（手册 4.10(3)）"
+        state = self.missile_state(m)
+        if state in ("spent", "lost"):
+            return False, "巡飞弹已消耗/已损失（状态 %s），不能再次发射" % state
+        if state != "carried":
+            return False, "巡飞弹未部署上车（手册 4.10(3)）"
         if m.detail.get("carrier") != c.id:
-            return False, "巡飞弹未部署在该车上（手册 4.10(3)）"
-        if c.detail.get("launched_missile"):
-            return False, "该车本局已发射过巡飞弹（手册 4.10(4)）"
+            return False, "巡飞弹部署在别的载车上（手册 4.10(3)）"
+        if not c.alive():
+            return False, "载车已被消灭"
+        if not c.color:
+            return False, "载车没有阵营"
+        if self.in_flight_missile(c.id) is not None:
+            return False, "该车已有一枚巡飞弹在飞（手册 4.10(4)）"
+        # 发射：把弹从载车的载员表里**移出**（不得重复卸载/重复发射同一枚）。
         m.detail.pop("carrier", None)
-        # 想定里巡飞弹是「在车内」记录（blood=0、无阵营）：发射后变成图上单位，
-        # 与下车同理需要恢复阵营与编制兵力，否则它一直不算活/不算分，
-        # 且 `alive()` 检查会让发射永远失败（blood=0 ⇒ 已损失）。
+        carried = list(c.detail.get("carried") or [])
+        if m.id in carried:
+            carried.remove(m.id)
+        c.detail["carried"] = carried
+        # 发射后弹体是图上的独立单位：恢复阵营与编制兵力（与“下车”同理）。
         m.color = c.color
         if m.blood <= 0:
             establishment = m.establishment or carried_establishment(m.data)
@@ -354,26 +566,71 @@ class Game:
         m.units = max(1, m.blood) if m.typeid in (1, 2) else 1
         m.pos = c.pos
         m.pos2 = c.pos
+        m.detail["missile_state"] = "loitering"
         m.detail["launcher"] = c.id
-        m.detail["loiter_until"] = self.second + self.LOITER_SEC
+        m.detail["launch_second"] = self.second
+        # 时间字段来源：客户端用 ObjAjax 下发的 `radar` 算巡飞计时；这里原样留存。
+        m.detail["launch_radar"] = m.radar or ""
+        m.detail["loiter_seconds"] = self.loiter_sec
+        m.detail["loiter_seconds_source"] = self.loiter_sec_source
+        m.detail["loiter_until"] = self.second + self.loiter_sec
         c.detail["launched_missile"] = m.id
-        self.record("%s 发射巡飞弹 %s（巡飞时长 %d 秒）"
-                    % (c.army or c.name, m.id, self.LOITER_SEC))
+        c.detail["stop"] = 1              # 平台：载车在飞占用（客户端读 `stop` 决定能否再发）
+        self.record("%s 发射巡飞弹 %s（巡飞上限 %s 秒，取值来源 %s）"
+                    % (c.army or c.name, m.id, self.loiter_sec,
+                       self.loiter_sec_source))
         return True, ""
 
+    def _terminate_missile(self, m, why):
+        """在飞弹终止（超时自毁 / 载车被毁）：置 `lost`、清动作并释放载车占用。"""
+        m.blood = 0
+        m.detail["missile_state"] = "lost"
+        m.detail.pop("loiter_until", None)
+        self._clear_missile_actions(m)
+        self.release_launcher(m.detail.get("launcher"))
+        self.record("巡飞弹 %s 终止：%s" % (m.id, why))
+
+    def _consume_missile(self, m):
+        """攻击完成后弹体消失（负责人 2026-10-16 确认），并释放载车占用。
+
+        只由**已执行**的攻击调用：所有校验拒绝都在 `attack()` 里提前返回，走不到这里，
+        所以被拒绝的（没有实际执行的）攻击不会误消耗弹体（issue #1 第 4 条）。
+        """
+        m.blood = 0
+        m.detail["missile_state"] = "spent"
+        m.detail["consumed"] = True
+        m.detail.pop("loiter_until", None)
+        self._clear_missile_actions(m)
+        self.release_launcher(m.detail.get("launcher"))
+        self.record("巡飞弹 %s 攻击完成，弹体消耗（负责人确认：攻击后消失）" % m.id)
+
+    @staticmethod
+    def _clear_missile_actions(m):
+        """消耗/损失后不得继续移动、侦察或重复攻击：清掉机动路径与持续打击。"""
+        for key in ("path", "path_idx", "move_until", "target", "target_weapon"):
+            m.detail.pop(key, None)
+        m.pos2 = m.pos
+
     def _expire_missiles(self, now):
-        """手册 4.10(5)：巡飞超时自毁；发射车被摧毁则自毁。"""
+        """手册 4.10(5)：巡飞超时自毁；发射车被摧毁则自毁。
+
+        两个终止分支都**释放载车占用**（`release_launcher`）—— 原实现只把弹血量清零，
+        载车的 `launched_missile` 永久留着，于是“第二枚”永远发不出去。
+        """
         for u in self.units.values():
-            if not u.is_loitering_missile() or not u.alive() or not u.detail.get("launcher"):
+            if not u.is_loitering_missile() or self.missile_state(u) != "loitering":
                 continue
-            if u.detail.get("loiter_until") and u.detail["loiter_until"] <= now:
-                u.blood = 0
-                self.record("巡飞弹 %s 巡飞超时自毁（手册 4.10(5)）" % u.id)
+            deadline = u.detail.get("loiter_until")
+            if deadline and deadline <= now:
+                self._terminate_missile(u, "巡飞超时自毁（手册 4.10(5)）")
                 continue
-            lc = self.units.get(u.detail["launcher"])
+            lc = self.units.get(u.detail.get("launcher"))
             if lc is None or not lc.alive():
-                u.blood = 0
-                self.record("发射车被摧毁，巡飞弹 %s 自毁（手册 4.10(5)）" % u.id)
+                self._terminate_missile(u, "发射车被摧毁（手册 4.10(5)）")
+        # 载车占用与实际在飞弹保持一致（弹已被消耗/损失 ⇒ 立即释放，不留永久锁）。
+        for c in self.units.values():
+            if c.detail.get("launched_missile") and self.in_flight_missile(c.id) is None:
+                self.release_launcher(c.id)
 
     @property
     def time1(self):
@@ -497,9 +754,19 @@ class Game:
     # 手册 4.1.2(4)：沿道路以机动状态行驶时，速度不受地形和高差影响。
     # 想定 7527 的道路标记落在格的 `note` 字段（观测到取值「主要」「次要」）。
     ROAD_NOTES = ("主要", "次要")
-    # 手册 4.10(5)：巡飞弹巡飞超时自毁。**手册未给具体时长**，此处为想定占位值，
-    # 待由想定/SetUp 提供真实值后替换（不臆造成事实）。
-    LOITER_SEC = 120
+    @classmethod
+    def loiter_seconds(cls, room_speed=DEFAULT_ROOM_SPEED,
+                       room_units=LOITER_ROOM_UNITS):
+        """客户端 `FlyTime = parseInt(1200 / RoomSpeed)` → 巡飞超时上限（秒）。
+
+        ⚠️ **未确证**：`radar` / `ServerTime` 的尺度与 `RoomSecond`（本引擎 `Game.second`）
+        是否完全一致**没有实测样本**；本函数只把客户端公式搬到训练时钟上，并把取值的
+        来源逐弹记进 `detail["loiter_seconds_source"]`，不宣称已与平台对账。
+        """
+        if isinstance(room_speed, bool) or not isinstance(room_speed, (int, float)) \
+                or room_speed <= 0:
+            raise ValueError("room_speed must be a positive number")
+        return max(1, int(room_units // room_speed))
 
     def _charge_meters(self, unit, meters):
         """手册 4.1.1(4)：人员每冲锋 200 米转为疲劳状态。
@@ -778,6 +1045,11 @@ class Game:
         self.record("直瞄：%s → %s（%s）%s" % (a.army or a.name, t.army or t.name,
                                               "；".join(r["detail"]), "，".join(msg) or "无效"))
         self.dirty = True
+        if a.is_loitering_missile():
+            # 负责人 2026-10-16 确认：攻击后巡飞弹消失 —— 不能继续移动、侦察或重复攻击，
+            # 同时解除发射车的在飞占用。放在这里而不是开头：上面每一条校验拒绝都是
+            # **提前 return**，所以"被拒绝、没有实际执行的攻击不会误消耗弹体"。
+            self._consume_missile(a)
         return r, None
 
     # ---------------- 持续打击 / 集火射击 ----------------

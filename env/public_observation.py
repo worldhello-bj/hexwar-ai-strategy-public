@@ -22,6 +22,8 @@ _OWN_FIELDS = frozenset({
     "id", "army", "name", "typeid", "pos", "hexid", "blood", "suppressed",
     "color", "score", "armor", "hidden", "ste", "loaded_into", "carrying",
     "engaging", "weapons", "can_observe_range",
+    # 手册 4.10 巡飞弹生命周期（显式暴露，不静默丢失）：状态、在飞占用、剩余巡飞秒
+    "missile_state", "missile_in_flight", "loiter_seconds_left",
 })
 _VISIBLE_FIELDS = frozenset({
     "id", "name", "typeid", "color", "pos", "hexid", "blood", "suppressed",
