@@ -77,6 +77,10 @@ py -3.13 tools/verify_tables.py         # 30/30
 py -3.13 tools/verify_unfavorable.py    # 31/31（含线上实测样本反查）
 py -3.13 tools/hex_score_audit.py       # 引擎计分 == 平台 354/234
 
+# 4b) 到**实际服务器**复核开局初设（需账号环境变量；默认只读）
+py -3.13 tools/hex_opening_check.py --list-rooms        # 大厅房间状态码
+py -3.13 tools/hex_opening_check.py --as b --room <空闲序号> --enter --start
+
 # 5) 规则强化训练环境（自包含；先过规则门，过了才开训）
 cd train
 py -3.13 run_train.py rules
@@ -190,7 +194,7 @@ $env:HEXWAR_SNAP="D:\你的快照目录"
 | `engine/` | 裁决引擎：几何、装备库、裁决表、对局状态机 |
 | `env/` | 策略搜索环境、参考智能体、跑分台 |
 | `offline/` | 官方前端离线运行所需的桩服务器（需自备前端资源） |
-| `tools/` | 采集、解析、构建、自检脚本（含站点探测 `probe_site.py`、端点勘察 `probe_endpoints.py`、双服比对 `compare_servers.py`、指令词汇 `extract_commands.py`、规则验证 `verify_rules.py`、裁决表校验 `verify_tables.py`、不利修正/两颗骰 CRT 验证 `verify_unfavorable.py`、枚举差分 `hex_env_diff.py`、计分对账 `hex_score_audit.py`） |
+| `tools/` | 采集、解析、构建、自检脚本（含站点探测 `probe_site.py`、端点勘察 `probe_endpoints.py`、双服比对 `compare_servers.py`、指令词汇 `extract_commands.py`、规则验证 `verify_rules.py`、裁决表校验 `verify_tables.py`、不利修正/两颗骰 CRT 验证 `verify_unfavorable.py`、枚举差分 `hex_env_diff.py`、计分对账 `hex_score_audit.py`、开局初设实服复核 `hex_opening_check.py`、初设数据修正 `fix_opening_sons.py` / `fix_opening_pos2.py`） |
 | `samples/demo/` | 自带合成想定（原创数据） |
 | `skill/` | AI 助手用的 skill 包 |
 | `docs/` | 接口对照表、裁决引擎说明、离线客户端说明、[站点探测记录](docs/站点探测.md)、[规则符合性对照](docs/规则符合性.md)、[计分规则待确认](docs/计分规则待确认.md)、[计分对账](docs/计分对账.md) |
@@ -203,6 +207,10 @@ $env:HEXWAR_SNAP="D:\你的快照目录"
 - 直瞄裁决链路端到端跑通（攻击等级 → 修正 → 战果 → 状态变化）
 - 离线客户端可被鼠标实操，指令经引擎裁决并回写态势
 - 装备映射（武器 ID ↔ 名称/射程/弹药类型/装甲）与官方接口交叉校验一致
+- **开局初设与实际服务器逐字段一致**：`scenario/7527/units.json` 与练习服空闲房间的
+  `Obj_Get.asp` 比对 **0 差异**（初设与开局第 0 秒均为“36 单位全在场、车内 0、`sons=0`、
+  `pos2 == pos`”），复核工具 `tools/hex_opening_check.py`，
+  见 [`scenario/7527/README.md`](scenario/7527/README.md#实服复核可复现)
 
 **未验证 / 已知不足**
 

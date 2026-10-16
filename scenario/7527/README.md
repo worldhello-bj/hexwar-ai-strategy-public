@@ -8,7 +8,7 @@
 | 文件 | 规模 | 字段 |
 |---|---|---|
 | `map_hexes.json` | 2721 格 | `elevation` 高程(m) / `cond` 地形 / `step` 通行等级 / `note` 道路 / `hex` 贴图索引 |
-| `units.json` | 36 个单位 | `name`/`army` 编制、`typeid`（1 人员 2 车辆 3 空中 4 工事）、`data` 装备、`pos` 开局格、`blood` 兵力、`sons` 车内单位数（开局恒为 0）、`score` 权重分值 |
+| `units.json` | 36 个单位 | `name`/`army` 编制、`typeid`（1 人员 2 车辆 3 空中 4 工事）、`data` 装备、`pos` 开局格、`pos2` 目标格（开局恒等于 `pos`）、`blood` 兵力、`sons` 车内单位数（开局恒为 0）、`score` 权重分值 |
 | `cities.json` | 3 个夺控点 | `name` 主要/次要、`pos` 所在格 |
 
 行列数 100×18；红蓝各 18 个单位。`units.json` 已对齐**平台真实开局**
@@ -17,7 +17,27 @@
 * 36 个实体**全部在场**：`blood>0` 且 `pos>0`（没有谁被写成"已上车"）；
 * 载具的 `sons`（车内单位数）**一律为 0** —— 开局乘员以独立实体停在载具同格，
   上车后 `sons` 才等于车内人数（中局才出现 1/4 这类值）；
+* 每个单位的 `pos2`（目标格）开局**等于自己的 `pos`**；
 * 全部 `pos` 都落在地图格内，`data`/`wz` 都能在装备表里查到。
+
+### 实服复核（可复现）
+
+`tools/hex_opening_check.py` 直接到实际服务器读同一批字段并与本目录逐条比对：
+
+```bash
+HEXWAR_USER=<账号> HEXWAR_PASS=<口令> py -3.13 tools/hex_opening_check.py --list-rooms
+# 挑一间大厅状态"空闲可进"（状态码 0）的房，用第二个账号进去实测：
+HEXWAR_USER2=<账号> HEXWAR_PASS2=<口令> py -3.13 tools/hex_opening_check.py \
+    --as b --room <序号> --enter --start
+```
+
+2026-10-16 在练习服空闲推演室实测的结果：**进房后与开局后（第 0 秒）两次都是
+36 单位全在场、`车内 0`、载具 `sons>0` 为 0、`pos2 == pos`**，与本目录 **0 差异**；
+同服一间开局 11 小时的中局房间里则有 18 条 `pos=0 / blood=0 / color=''` 的车内记录
+（`sons=1/2/4`）—— 证实“上车”是**局中动作**，不是初设。
+
+历史修复：`tools/fix_opening_sons.py`（`sons` 残留中局值）、
+`tools/fix_opening_pos2.py`（6 辆载具的 `pos2` 残留 0），两者都以上面的实测为证据。
 
 ## 数据来源与获取方式
 

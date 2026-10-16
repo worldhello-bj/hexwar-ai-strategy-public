@@ -1,7 +1,7 @@
 {
  "scenario_id": 7527,
  "name": "城市攻防作战（2V2）",
- "published_at": "2026-10-16 00:10:51",
+ "published_at": "2026-10-16 21:39:26",
  "source": {
   "practice": "http://www.hexwar.cn/WARGAMEAI/",
   "compete": "http://43.143.209.228/WARGAMEAI",
@@ -19,9 +19,17 @@
    "2p_before_start.json",
    "2p_after_start.json"
   ],
+  "live_recheck": {
+   "date": "2026-10-16",
+   "host": "http://www.hexwar.cn（练习服，空闲推演室）",
+   "tool": "tools/hex_opening_check.py --as b --room <序号> --enter --start",
+   "result": "进房后与开局后两次均 36 单位全在场 / 车内 0 / sons>0 为 0 / pos2==pos，与发布数据 0 差异",
+   "contrast": "同服一间开局 11 小时的中局房里 18 条 pos=0/blood=0/color='' 的车内记录（sons=1/2/4）"
+  },
   "asserts": [
    "36 单位全部在场（blood>0 且 pos>0）",
-   "载具 sons 一律为 0（开局乘员与载具同格、独立成 entity）"
+   "载具 sons 一律为 0（开局乘员与载具同格、独立成 entity）",
+   "每个单位 pos2 == pos（目标格 = 自己所在格）"
   ],
   "check": "py -3.13 tools/verify_scenario_units.py"
  },
@@ -45,8 +53,8 @@
    "bytes": 365083
   },
   "units.json": {
-   "sha1": "d444314d407e93a718f5f67e6e7c0f9f59943e01",
-   "bytes": 47156
+   "sha1": "be0eacd0bbce39268a4338d68aa6c5ed5d5a1bae",
+   "bytes": 47186
   }
  },
  "sensitive_scan": {
