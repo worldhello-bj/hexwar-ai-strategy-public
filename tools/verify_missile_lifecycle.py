@@ -14,7 +14,7 @@
 | T1 | 为「未部署 / 车内 / 在飞 / 已消耗或损失」建立**明确转换**，保留载车与时间字段来源 |
 | T2 | 车内 `blood=0` 可发射；已损失不复活；开局前 / 错误载车 / 已毁载车均拒绝 |
 | T3 | 接通合法动作生成、校验、执行，以及实时包装层的调度；发射耗时不补造 |
-| T4 | 人员卸载不发射巡飞弹；发射移除 carried；不能重复卸载 / 重复发射同一枚 |
+| T4 | 下车只卸人员 / 无人车（巡飞弹留在车内，`off=3` 是发射不是取回）；发射移除 carried；不能重复发射同一枚 |
 | T5 | 同车已有在飞弹时拒绝第二枚；消耗或超时后释放占用；载车被毁则终止在飞弹 |
 | T6 | 攻击后弹体消失、不能再次行动；伤害与消耗只结算一次；非法或未执行的攻击不消耗 |
 | T7 | 计时覆盖不同 RoomSpeed、保存恢复、超时边界；先核对训练秒映射 |
@@ -257,22 +257,29 @@ def t3_interface(fixture):
 
 # ---------------------------------------------------------------- T4
 def t4_unload(fixture):
-    print("\n== T4 卸载不发射 / 发射移除 carried / 不重复 ==")
+    print("\n== T4 下车不含巡飞弹 / 发射移除 carried / 不重复 ==")
     env = HexwarEnv(snapshot=fixture, side="BLUE", max_seconds=600, fog=False,
                     move_radius=1)
     env.reset(seed=4)
-    env.step({"type": "load", "unit": "missileA", "carrier": "carrier"})
+    env.step([{"type": "load", "unit": "missileA", "carrier": "carrier"},
+              {"type": "load", "unit": "squad", "carrier": "carrier"}])
     car = env.game.units["carrier"]
-    check("T4", "部署后弹在载车的 carrying 里",
-          car.detail.get("carried") == ["missileA"], car.detail.get("carried"))
-    env.step({"type": "unload", "unit": "carrier"})
-    m = env.game.units["missileA"]
-    check("T4", "卸载**不发射**：弹回到未部署态、不是在飞",
-          env.game.missile_state(m) == "unassigned" and not m.detail.get("launcher"),
-          env.game.missile_state(m))
-    check("T4", "卸载后不能再部署（开局窗口已过，手册 4.10(3)）",
-          [a for a in env.legal_actions() if a.get("type") == "load"
-           and a.get("unit") == "missileA"] == [])
+    check("T4", "部署后弹与人员都在载车的 carrying 里",
+          sorted(car.detail.get("carried") or []) == ["missileA", "squad"],
+          car.detail.get("carried"))
+    _o, _r, _d, info = env.step({"type": "unload", "unit": "carrier"})
+    check("T4", "下车只卸人员：弹留在车上（客户端「全员下车」只发 off=1/2；off=3 是发射）",
+          car.detail.get("carried") == ["missileA"]
+          and env.game.missile_state(env.game.units["missileA"]) == "carried"
+          and env.game.units["squad"].pos == car.pos,
+          "carried=%s" % (car.detail.get("carried"),))
+    check("T4", "车上只剩弹时「下车」不可用（不存在“把弹取回”）",
+          not [a for a in env.legal_actions() if a.get("type") == "unload"]
+          and env.step({"type": "unload", "unit": "carrier"})[3]
+          .get("invalid_action"))
+    check("T4", "弹没有被“取回”：状态仍是 carried、不在图上",
+          env.game.missile_state(env.game.units["missileA"]) == "carried"
+          and not env.game.units["missileA"].alive())
 
     env2 = HexwarEnv(snapshot=fixture, side="BLUE", max_seconds=600, fog=False,
                      move_radius=1)

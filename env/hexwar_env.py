@@ -375,8 +375,9 @@ class HexwarEnv:
                     if m is not None and m.is_loitering_missile():
                         acts.append({"type": "launch", "unit": u.id,
                                      "missile": m.id})
-            # 下车（手册 3.3）：由车辆下达
-            if u.typeid == 2 and u.detail.get("carried"):
+            # 下车（手册 3.3）：由车辆下达。★ **巡飞弹不参与下车** —— 客户端「全员下车」
+            # 只发 `off=1/2`（人员/无人车），`off=3` 走的是发射命令（见 `Unit.can_disembark`）。
+            if u.typeid == 2 and self._disembarkable(g, u):
                 acts.append({"type": "unload", "unit": u.id})
             # 手雷（手册 3.15 / 4.7）：投掷范围通常为相邻格
             if u.typeid == 1 and 144 in u.wz and u.ammo.get("a5", 0) > 0:
@@ -527,8 +528,8 @@ class HexwarEnv:
             m = g.units.get(act.get("missile"))
             if u.typeid != 2 or m is None or m.id == u.id:
                 raise ValueError("launch requires a vehicle and a missile to launch")
-        if kind == "unload" and (u.typeid != 2 or not u.detail.get("carried")):
-            raise ValueError("unload requires a loaded vehicle")
+        if kind == "unload" and (u.typeid != 2 or not self._disembarkable(g, u)):
+            raise ValueError("unload requires a loaded vehicle with disembarkable units")
         if kind in ("area_fire", "grenade"):
             hx = act.get("target_hex")
             if not isinstance(hx, int) or isinstance(hx, bool) or not g.hex(hx):
@@ -611,6 +612,20 @@ class HexwarEnv:
         self._remember()
         self._check_done()
         return self.observe(), float(self.score()["diff"] - before), self.done, info
+
+    @staticmethod
+    def _disembarkable(g, carrier):
+        """该载车上**可以下车**的载员（人员 / 无人车）。
+
+        巡飞弹与其它空中弹不在此列：它们只能通过 `launch` 离开载车
+        （客户端「全员下车」也只发 `off=1/2`，`off=3` 是发射命令）。
+        """
+        out = []
+        for pid in carrier.detail.get("carried") or []:
+            p = g.units.get(pid)
+            if p is not None and p.can_disembark():
+                out.append(p)
+        return out
 
     def _load_gate(self, u, car):
         """`load` 的合法性判定（`_apply` 与 `_cheap_ok_stateful` **共用同一条口径**）。
@@ -769,11 +784,14 @@ class HexwarEnv:
             if u.stunned(g.second):
                 return None, 0.0, False, {
                     "msg": "车辆被压制时人员不能下车（手册 4.6.3(1)(4)）", "seconds": 0}
+            passengers = self._disembarkable(g, u)
+            if not passengers:
+                # 车上只有弹：**没有**“把弹取回”这个动作（弹只能发射）。
+                return None, 0.0, False, {
+                    "msg": "车上没有可下车的人员（巡飞弹只能发射，不能下车）",
+                    "seconds": 0}
             out = []
-            for pid in list(u.detail.get("carried") or []):
-                p = g.units.get(pid)
-                if p is None:
-                    continue
+            for p in passengers:
                 # 注意：**不能**用 `alive()` 过滤 —— 快照里的载员 blood=0 表示
                 # "在车内读不到兵力"，不是"已阵亡"。
                 # 下车后**恢复独立身份**：平台下车会新建实体并带上阵营色与编制兵力
@@ -791,12 +809,10 @@ class HexwarEnv:
                 p.pos = u.pos
                 p.pos2 = u.pos
                 p.detail.pop("carrier", None)
-                if p.is_loitering_missile():
-                    # ★ 「人员卸载不发射巡飞弹」：卸载只是把弹**取回**（未发射）——
-                    #   回到 `unassigned`；发射只能由显式的 `launch` 动作发生。
-                    p.detail.pop("missile_state", None)
                 out.append(p.id)
-            u.detail["carried"] = []
+            # 弹留在车上（它们只能通过 `launch` 离开载车）—— 不要把 carried 整个清空。
+            u.detail["carried"] = [x for x in (u.detail.get("carried") or [])
+                                   if x not in out]
             return None, 0.0, False, {"msg": "下车 %d 个" % len(out), "seconds": LOAD_SEC}
         if t == "launch":
             # 手册 4.10(3)(4)：由载车发射；状态机（在飞占用/一车一枚/超时）在引擎里。

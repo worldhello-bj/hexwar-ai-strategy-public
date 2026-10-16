@@ -190,19 +190,27 @@ class MissileEnvPipelineTests(MissileFixture):
         carrier = next(u for u in obs["own"] if u["id"] == "carrier")
         self.assertEqual(carrier["missile_in_flight"], "missileA")
 
-    def test_unload_returns_missile_without_launching(self):
+    def test_unload_does_not_disembark_missiles(self):
+        """下车只针对人员/无人车；巡飞弹留在车上（它只能发射，不能“取回”）。"""
         env = self.env()
         env.step({"type": "load", "unit": "missileA", "carrier": "carrier"})
-        self.assertEqual(env.game.units["carrier"].detail["carried"], ["missileA"])
-        env.step({"type": "unload", "unit": "carrier"})
+        env.step({"type": "load", "unit": "squad", "carrier": "carrier"})
+        carrier = env.game.units["carrier"]
+        self.assertEqual(sorted(carrier.detail["carried"]), ["missileA", "squad"])
+        _o, _r, _d, info = env.step({"type": "unload", "unit": "carrier"})
+        self.assertFalse(info.get("invalid_action"), info)
+        self.assertEqual(carrier.detail["carried"], ["missileA"])
         m = env.game.units["missileA"]
-        self.assertEqual(env.game.missile_state(m), "unassigned")
-        self.assertNotIn("launcher", m.detail)
-        self.assertNotIn("missile_state", m.detail)
-        self.assertEqual(m.blood, m.establishment)
-        # 卸载后不能重复部署（开局窗口已过）
-        self.assertFalse([a for a in env.legal_actions()
-                          if a.get("type") == "load" and a.get("unit") == "missileA"])
+        self.assertEqual(env.game.missile_state(m), "carried")
+        self.assertEqual(m.detail.get("carrier"), "carrier")
+        self.assertEqual(env.game.units["squad"].pos, carrier.pos)   # 人员正常下车
+        # 车上只剩弹 ⇒ 下车动作不可用（不静默成功、也不“把弹取回”）
+        self.assertNotIn({"type": "unload", "unit": "carrier"},
+                         env.legal_actions())
+        info = env.step({"type": "unload", "unit": "carrier"})[3]
+        self.assertTrue(info.get("invalid_action"), info)
+        self.assertEqual(env.game.missile_state(env.game.units["missileA"]),
+                         "carried")
 
     def test_launch_removes_carried_and_blocks_repeat(self):
         env = self.env()

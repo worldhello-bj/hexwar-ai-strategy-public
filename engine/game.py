@@ -132,6 +132,16 @@ class Unit:
         """无人战车（手册 4.9）：地面无人平台。按名称前缀「无人」识别。"""
         return self.typeid == 2 and (self.name or "").startswith("无人")
 
+    def can_disembark(self):
+        """手册 3.3 的**下车**对象：人员与无人战车（`typeid` 1 / 2）。
+
+        巡飞弹与其它空中弹（`typeid` 3）**不能下车**：客户端「全员下车」只连发
+        `off=1`（人员）/ `off=2`（无人车），而 `off=3` 走的是 `com/Obj2_Out.asp` +
+        `CommandOff` —— 那是**发射**命令（要求载车 `stop != 1`，且开始前不允许）。
+        所以弹离开载车只有**发射**一条路；中途把它“取回”（回到未部署）在平台上并不存在。
+        """
+        return self.typeid in (1, 2)
+
     def out_of_control(self):
         """手册 4.9(3)：无人战车失去有人战车依托 → 失控。"""
         return bool(self.detail.get("out_of_control"))
