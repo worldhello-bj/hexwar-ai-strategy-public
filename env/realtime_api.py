@@ -28,6 +28,21 @@ r"""实时（1 Hz）双席对局接口 —— 与正式规则同粒度。
 `TwoPlayerEpisode` 原样保留（不破坏既有测试与基线），本模块是**新接口**。
 两者共用同一套 `engine/`，所以规则只有一份。
 
+## 训器侧接入（2026-10-17）
+
+`env/neural_train.py` 新增 `interface="realtime"`（默认仍 `serial`）：每秒双方各一次
+决策、学习目标 $R = S_{\text{终}} - S_{\text{开局}}$；配置 `train/configs/ppo_realtime.json`。
+成本实测：真实地图上**一次决策 ≈ 22 ms**（策略前向+特征）+ 环境 6 ms ⇒ 单局 1200 次决策
+≈ 107 s 墙钟。
+
+## 实测修过的坑（2026-10-17）
+
+`_enumerate` 以前把“可见敌人”重建为 `Unit({id,name,typeid,color,pos,hexid,blood,suppressed})`
+—— 只有 8 个公共字段，**丢掉 `hide`（掩蔽）/`ste`/`e2`（滞空高度）**。这两个字段正是
+`observe_range`（掩蔽距离减半）与 `unit_height`（LOS 高度）的输入 ⇒ 投影里能打的攻击，
+到权威状态上会被 `can_observe` 拒（`射击失败：不可观察`）。随机策略一撞即崩。
+现在可见敌人直接用**权威对象本身**（与己方同源），迷雾不变（只放本 tick 可见的敌人）。
+
 ## 奖励
 
 本模块**只负责环境**：`status()` 给出 `final_scores` 与 `opening_scores`。
@@ -224,10 +239,16 @@ class RealtimeEpisode:
         projected = copy.copy(authoritative)
         projected_game = copy.copy(authoritative.game)
         units = own_units_for_projection(authoritative.game, side)
+        # ★ 可见敌人直接用**权威对象本身**（与己方同源），不再用裁剪过的公共字段重建 Unit。
+        #   旧写法（`Unit({id,name,typeid,color,pos,hexid,blood,suppressed})`）丢掉了
+        #   `hide`（掩蔽）/`ste`/`e2`（滞空高度）等**判定字段**，于是投影里的
+        #   `observe_range` 不减半、`unit_height` 也错，枚举会 advertise 出执行时被
+        #   `can_observe` 拒绝的攻击 —— 实测随机/采样一撞就报「射击失败：不可观察」。
+        #   迷雾仍然保留：只放**本 tick 可见**的敌人，看不见的照旧缺席。
         for public in view["enemy_visible"]:
-            u = Unit(public)
-            u.stunned_until = second + 1 if public["suppressed"] else 0
-            units[u.id] = u
+            u = authoritative.game.units.get(public["id"])
+            if u is not None and u.alive():
+                units[u.id] = u
         projected_game.units = units
         projected.game = projected_game
         raw = projected.legal_actions(move_radius=self._move_radius,

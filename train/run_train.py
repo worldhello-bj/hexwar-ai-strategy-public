@@ -88,6 +88,7 @@ FLAGS = {
     "learning_rate": "--learning-rate",
     "observation_schema": "--observation-schema",
     "baseline_offset": "--baseline-offset",
+    "interface": "--interface",
     "update_mode": "--update-mode",
     "ppo_clip": "--ppo-clip",
     "update_epochs": "--update-epochs",
@@ -115,7 +116,7 @@ ALLOWED = {
             "max_steps", "buckets", "hidden_dim", "learning_rate",
             "observation_schema", "baseline_offset", "update_mode", "scoring",
             "ppo_clip", "update_epochs", "checkpoint", "resume", "report",
-            "deploy_window"),
+            "interface", "deploy_window"),
     "eval": ("checkpoint", "snapshot", "seeds", "report", "allow_real_map"),
     "diff": ("snapshot", "radius", "steps"),
 }

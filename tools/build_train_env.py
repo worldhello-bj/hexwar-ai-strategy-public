@@ -50,6 +50,10 @@ DATA_LINKS = ("snapshot",)
 # 手工维护、绝不被脚本覆盖的文件/目录
 AUTHORED = ("README.md", "run_train.py", "configs", "skill", "requirements.txt",
             "MANIFEST.json", ".gitignore")
+# 运行产物目录：**同步时也不能删**（train/ 里唯一会不断累积的训练产物、检查点、评测报告）
+# ★ 历史 bug：`check()` 明确排除它，但同步的清理循环没排除 ⇒ 一跑同步就把
+#   `train/analysis/**` 全删了（包括几十 MB 的检查点）。两处口径必须一致。
+PRODUCT_DIRS = ("analysis",)
 SKIP_DIRS = {"__pycache__", ".pytest_cache", ".git"}
 SKIP_EXT = {".pyc", ".pyo"}
 
@@ -113,7 +117,7 @@ def sync():
     # 清掉 train/ 里过期的生成物（不在本次清单里的）
     for base, dirs, fs in os.walk(TRAIN):
         dirs[:] = [d for d in dirs if d not in SKIP_DIRS
-                   and d not in AUTHORED]
+                   and d not in AUTHORED and d not in PRODUCT_DIRS]
         rel_dir = os.path.relpath(base, TRAIN)
         if rel_dir == ".":
             continue
@@ -166,7 +170,7 @@ def check():
                for b, d, fs in os.walk(TRAIN) for n in fs
                if not any(x in b.split(os.sep) for x in SKIP_DIRS)
                and not any(x in b.split(os.sep) for x in DATA_LINKS)
-               and "analysis" not in b.split(os.sep)}      # analysis/ 是运行产物目录
+               and not any(x in b.split(os.sep) for x in PRODUCT_DIRS)}   # analysis/ 是运行产物目录
     extra = sorted(r for r in current
                    if r not in files and r.split("/")[0] not in AUTHORED)
     print("train/ MANIFEST 版本 %s（源 %s）"

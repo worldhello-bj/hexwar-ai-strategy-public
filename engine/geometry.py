@@ -8,9 +8,19 @@ mapid = 10000*(row//2) + 2*col + (row % 2)
 """
 
 import math
+from functools import lru_cache
 
 HEX_W = 52
 HEX_ROW_H = 90
+
+
+@lru_cache(maxsize=65536)
+def _split_mapid(mapid):
+    b = mapid // 10000
+    c = mapid % 2
+    row = 2 * b + c
+    col = js_round((mapid - 10000 * b) / 2) - (1 if c else 0)
+    return row, col
 
 
 def js_round(x):
@@ -19,14 +29,16 @@ def js_round(x):
 
 
 def split_mapid(mapid):
-    mapid = int(mapid)
-    b = mapid // 10000
-    c = mapid % 2
-    row = 2 * b + c
-    col = js_round((mapid - 10000 * b) / 2) - (1 if c else 0)
-    return row, col
+    """mapid → (row, col)。
+
+    ★ `lru_cache`（纯函数，无副作用）：实时训练下这个函数会被调上百万次
+    （枚举邻格 / 测距 / 通视），1 Hz 实时训练的主要成本就包括这里的
+    `make_mapid`/`split_mapid` 字符串↔整数往返（实测单局 190 万次调用）。
+    """
+    return _split_mapid(int(mapid))
 
 
+@lru_cache(maxsize=65536)
 def make_mapid(row, col, firstid=80014):
     """按客户端 LoadCurrentCity 的编号方式由 (row,col) 生成 mapid。"""
     b = row // 2
@@ -42,8 +54,9 @@ def pos_of(mapid):
     return x, y
 
 
+@lru_cache(maxsize=65536)
 def to_cube(mapid):
-    row, col = split_mapid(mapid)
+    row, col = _split_mapid(mapid)
     # odd-r 偏移转立方坐标
     q = col - (row - (row & 1)) // 2
     r = row
@@ -57,8 +70,9 @@ def distance(a, b):
     return (abs(aq - bq) + abs(ar - br) + abs(as_ - bs)) // 2
 
 
-def neighbors(mapid):
-    row, col = split_mapid(mapid)
+@lru_cache(maxsize=65536)
+def _neighbors(mapid):
+    row, col = _split_mapid(mapid)
     if row % 2 == 0:
         offs = [(0, -1), (0, 1), (-1, -1), (-1, 0), (1, -1), (1, 0)]
     else:
@@ -69,7 +83,12 @@ def neighbors(mapid):
         if r2 < 0 or c2 < 0:
             continue
         out.append(make_mapid(r2, c2))
-    return out
+    return tuple(out)
+
+
+def neighbors(mapid):
+    """邻格（返回新 list，调用方可以随意改；纯函数体走缓存）。"""
+    return list(_neighbors(int(mapid)))
 
 
 def hexid(mapid):

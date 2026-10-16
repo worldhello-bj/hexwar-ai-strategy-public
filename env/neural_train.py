@@ -21,6 +21,24 @@ from .episode_api import TwoPlayerEpisode
 from .match_eval import SIDES, _positive_int, snapshot_manifest
 from .neural_policy import NeuralPolicy, Decision
 from .public_observation import PublicObservationAdapter
+from .realtime_api import RealtimeEpisode
+
+#: 对局接口，决定了"一局里有多少个决策点"这个根本语义：
+#:
+#: * `serial`  = 回合制 `TwoPlayerEpisode`：一次 `step` 是一方一条指令，**时钟按这条指令
+#:   自己的时长整段跳** ⇒ 一条 60 秒的机动期间对手没有任何决策点；1200 秒一局每方只有
+#:   ~12–15 次决策。保留它只为历史基线可比。
+#: * `realtime` = 1 Hz `RealtimeEpisode`：**每秒双方各一次**决策，机动登记为路径并在统一
+#:   时间轴上按秒推进（某单位机动**不**阻塞其它单位与对手）⇒ 1200 秒一局每方 1200 次
+#:   机会。与平台同粒度，是“一方移动不必等另一方”的那个语义。
+INTERFACES = ("serial", "realtime")
+#: `RealtimeEpisode` 接受的构造参数（`episode_config` 中多余的键丢弃，如 `max_steps`）
+_REALTIME_KEYS = ("max_seconds", "move_radius", "fog", "public_score", "scoring_mode",
+                  "dt", "deploy_window")
+
+
+def realtime_episode_config(episode_config):
+    return {k: v for k, v in episode_config.items() if k in _REALTIME_KEYS}
 
 
 def canonical(value):
@@ -49,12 +67,15 @@ class NeuralTrainer:
     """
     def __init__(self, snapshot, *, seed=0, train_seed_start=0, batch_episodes=4,
                  episode_config=None, policy_config=None, heldout_seeds=(1000000, 1000001),
-                 observation_schema=1, allow_real=False, scoring_mode="verified"):
+                 observation_schema=1, allow_real=False, scoring_mode="verified",
+                 interface="serial"):
         for name, value in (("seed", seed), ("train_seed_start", train_seed_start)):
             _positive_int(name, value, True)
         _positive_int("batch_episodes", batch_episodes)
         if scoring_mode not in ("verified", "platform"):
             raise ValueError("scoring_mode must be 'verified' or 'platform'")
+        if interface not in INTERFACES:
+            raise ValueError("interface must be one of %s" % (INTERFACES,))
         self.snapshot = str(snapshot)
         self.allow_real = bool(allow_real)
         self.manifest = snapshot_manifest(snapshot, allow_real=self.allow_real)
@@ -64,7 +85,11 @@ class NeuralTrainer:
         # 奖励口径随 episode_config 一起检查点化：它决定了哪些分项能进"终局原始分"。
         self.episode_config["scoring_mode"] = scoring_mode
         self.scoring_mode = scoring_mode
-        TwoPlayerEpisode(snapshot, **self.episode_config)
+        self.interface = interface
+        if self.interface == "realtime":
+            RealtimeEpisode(snapshot, **realtime_episode_config(self.episode_config))
+        else:
+            TwoPlayerEpisode(snapshot, **self.episode_config)
         self.heldout_seeds = list(heldout_seeds)
         if not self.heldout_seeds or len(self.heldout_seeds) > 256 or len(set(self.heldout_seeds)) != len(self.heldout_seeds):
             raise ValueError("reserve 1 to 256 unique heldout seeds")
@@ -72,7 +97,12 @@ class NeuralTrainer:
             _positive_int("heldout seed", value, True)
         if isinstance(observation_schema, bool) or not isinstance(observation_schema, int) or observation_schema not in (1, 2):
             raise ValueError("observation_schema must be 1 or 2")
+        if self.interface == "realtime" and observation_schema != 1:
+            raise ValueError("realtime interface requires observation_schema 1")
         self.observation_schema = observation_schema
+        # 熵指标的采样间隔：回合制逐条（=1，历史口径），实时接口按 8 条抽一条
+        # （1200 次决策/局，多算一遍前向会让单局成本翻倍）
+        self.entropy_every = 1 if self.interface == "serial" else 8
         self.policy_config = copy.deepcopy(policy_config or {})
         representation = "public_v2_split" if observation_schema == 2 else "legacy_json"
         if self.policy_config.get("representation", representation) != representation:
@@ -90,9 +120,17 @@ class NeuralTrainer:
         if snapshot_manifest(self.snapshot, allow_real=self.allow_real) != self.manifest:
             raise ValueError("snapshot changed")
         start = time.perf_counter()
-        episode = TwoPlayerEpisode(self.snapshot, **self.episode_config)
-        public_episode = PublicObservationAdapter(episode) if self.observation_schema == 2 else episode
+        if self.interface == "realtime":
+            # 1 Hz：每秒双方各一次决策；机动登记为路径、在统一时间轴上按秒推进。
+            episode = RealtimeEpisode(self.snapshot,
+                                      **realtime_episode_config(self.episode_config))
+            public_episode = episode
+        else:
+            episode = TwoPlayerEpisode(self.snapshot, **self.episode_config)
+            public_episode = (PublicObservationAdapter(episode)
+                              if self.observation_schema == 2 else episode)
         status = episode.reset(seed=episode_seed)
+        opening_own = (status.get("opening_scores") or {}).get(learner_side)
         opponent_rng = random.Random(derived_seed(self.seed, episode_seed, learner_side, "opponent"))
         eval_rng = np.random.default_rng(derived_seed(self.seed, episode_seed, learner_side, "evaluation"))
         trajectory, entropies, counts = [], [], []
@@ -109,14 +147,20 @@ class NeuralTrainer:
                 break
             if side == learner_side:
                 observation = public_episode.observe(side)
-                probs = policy.probabilities(observation, candidates)
-                entropies.append(float(-np.sum(probs * np.log(np.maximum(probs, 1e-300)))))
                 counts.append(len(candidates))
                 decisions += 1
                 if training:
+                    # 熵只是**描述性指标**。实时接口下每局有 1200 次决策，每次多算一遍
+                    # 前向会直接把单局成本翻倍，所以按 `entropy_every` 抽样统计；
+                    # 回合制（十几条指令）仍逐条算，保持与历史报告可比。
+                    if decisions % self.entropy_every == 1:
+                        probs = policy.probabilities(observation, candidates)
+                        entropies.append(float(-np.sum(probs * np.log(np.maximum(probs, 1e-300)))))
                     action, decision = policy.sample(observation, candidates)
                     trajectory.append(decision)
                 else:
+                    probs = policy.probabilities(observation, candidates)
+                    entropies.append(float(-np.sum(probs * np.log(np.maximum(probs, 1e-300)))))
                     action = candidates[int(eval_rng.choice(len(candidates), p=probs))]
             else:
                 # No opposing observation is ever fetched or supplied to learner.
@@ -124,7 +168,10 @@ class NeuralTrainer:
             if side == learner_side and self.observation_schema == 2:
                 action = action["action"]
             status = episode.step(action, side=side)
-            if not status["terminated"] and any(status["rewards"].values()):
+            # 回合制接口的奖励合约是"只在终局给分"；实时接口的 `status` 不带 rewards
+            # （分数每秒都在变，按秒的增量由训练器侧的基线/差分处理）。
+            if (self.interface == "serial" and not status["terminated"]
+                    and any(status["rewards"].values())):
                 raise ValueError("episode violated terminal-only reward contract")
         own_score = diff = result = None
         if status["terminated"] and not status["truncated"]:
@@ -136,8 +183,17 @@ class NeuralTrainer:
             other = SIDES[1 - SIDES.index(learner_side)]
             diff = own_score - scores[other]
             result = "win" if diff > 0 else "loss" if diff < 0 else "draw"
+        # 学习目标：默认就是终局本方分（历史口径）。实时接口下减去**本方开局分**，
+        # 即 $R = S_{\\text{终}} - S_{\\text{开局}}$（见 `env/realtime_api.py` 的奖励说明），
+        # 这样"席位常数"（蓝 234 / 红 354）不再直接变成优势。
+        learning_return = own_score
+        if own_score is not None and opening_own is not None:
+            learning_return = own_score - opening_own
         record = {"seed": episode_seed, "learner_side": learner_side, "status": status,
-                  "own_score": own_score, "score_diff": diff, "result": result,
+                  "interface": self.interface,
+                  "own_score": own_score, "opening_own": opening_own,
+                  "learning_return": learning_return,
+                  "score_diff": diff, "result": result,
                   "decisions": decisions, "mean_entropy": float(np.mean(entropies)) if entropies else None,
                   "mean_candidates": float(np.mean(counts)) if counts else None,
                   "max_candidates": max(counts, default=0), "elapsed_seconds": time.perf_counter() - start}
@@ -162,7 +218,10 @@ class NeuralTrainer:
             self.episodes_attempted += 1
             if record["own_score"] is not None:
                 self.episodes_completed += 1
-                self.pending.append((trajectory, record["own_score"]))
+                # 学习目标：新记录里叫 `learning_return`（实时接口下=终局分−开局分）；
+                # 老记录/测试桩里没有这个键时退回终局本方分（历史口径）。
+                target = record.get("learning_return")
+                self.pending.append((trajectory, record["own_score"] if target is None else target))
                 if len(self.pending) == self.batch_episodes:
                     try:
                         record["update"] = self.policy.update_batch(self.pending)
@@ -210,6 +269,8 @@ class NeuralTrainer:
             # 混用两套奖励会污染训练，所以载入时必须逐步校验。
             "scoring_version": scoring.SCORING_VERSION,
             "scoring_mode": self.scoring_mode,
+            "interface": self.interface,
+            "entropy_every": self.entropy_every,
             "snapshot": self.manifest, "seed": self.seed, "train_seed_start": self.train_seed_start,
             "batch_episodes": self.batch_episodes, "episode_config": self.episode_config,
             "policy_config": self.policy_config, "heldout_seeds": self.heldout_seeds,
@@ -223,10 +284,13 @@ class NeuralTrainer:
             stream.write(canonical(self.checkpoint()) + "\n")
 
     @classmethod
-    def load(cls, path, snapshot, *, allow_real=False):
+    def load(cls, path, snapshot, *, allow_real=False, interface=None):
         data = json.loads(Path(path).read_text("utf-8"))
         if data.get("schema_version") != 1 or data.get("algorithm") not in ("neural_terminal_reinforce_vs_random", "neural_terminal_ppo_clip_vs_random"):
             raise ValueError("unsupported checkpoint")
+        saved_interface = data.get("interface", "serial")
+        if interface is not None and interface != saved_interface:
+            raise ValueError("requested interface differs from checkpoint")
         # 旧检查点（没有 scoring_version）是在旧计分口径下训练的，奖励不可比：
         # 直接拒绝，而不是静默拿它继续跑。
         if data.get("scoring_version") != scoring.SCORING_VERSION:
@@ -235,6 +299,7 @@ class NeuralTrainer:
                 % (data.get("scoring_version"), scoring.SCORING_VERSION))
         trainer = cls(snapshot, observation_schema=data.get("observation_schema", 1), allow_real=allow_real,
                       scoring_mode=data.get("scoring_mode", "verified"),
+                      interface=saved_interface,
                       **{k: data[k] for k in ("seed", "train_seed_start", "batch_episodes",
                                               "episode_config", "policy_config", "heldout_seeds")})
         if trainer.scoring_mode != data.get("scoring_mode", "verified"):
@@ -296,6 +361,10 @@ def main(argv=None):
     parser.add_argument("--deploy-window", choices=DEPLOY_WINDOWS, default="opening",
                         help="巡飞弹部署（上车）窗口：opening=对抗开始前（手册 4.10(3)，默认）；"
                              "any=未发射前随时（训练里要学到用弹就选它）")
+    parser.add_argument("--interface", choices=INTERFACES, default=None,
+                        help="对局接口：serial=回合制（旧口径；一次 step 一条指令、时钟整段跳）；"
+                             "realtime=1 Hz（每秒双方各一次决策、机动按秒并行推进，与平台同粒度）。"
+                             "不传时用检查点里记的那个（新训练默认 serial）。")
     parser.add_argument("--buckets", type=int, default=2048)
     parser.add_argument("--hidden-dim", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=0.001)
@@ -369,6 +438,7 @@ def main(argv=None):
             args.snapshot, observation_schema=args.observation_schema or 1, seed=args.seed, train_seed_start=args.train_seed_start, batch_episodes=args.batch_episodes,
             heldout_seeds=args.eval_seeds, episode_config=episode_config,
             allow_real=args.allow_real_map, scoring_mode=args.scoring_mode,
+            interface=args.interface or "serial",
             policy_config={"buckets": args.buckets, "hidden_dim": args.hidden_dim, "learning_rate": args.learning_rate,
                            **({"baseline_offset": args.baseline_offset} if args.baseline_offset is not None else {}),
                            **{k: getattr(args, k) for k in ("update_mode", "ppo_clip", "update_epochs") if getattr(args, k) is not None}})
@@ -376,6 +446,8 @@ def main(argv=None):
             raise ValueError("requested observation schema differs from resumed checkpoint")
         if args.scoring_mode != trainer.scoring_mode:
             raise ValueError("requested scoring mode differs from resumed checkpoint")
+        if args.interface is not None and args.interface != trainer.interface:
+            raise ValueError("requested interface differs from resumed checkpoint")
         if (args.baseline_offset is not None and
                 args.baseline_offset != trainer.policy.config.get("baseline_offset", "none")):
             raise ValueError("requested baseline offset differs from resumed checkpoint")
@@ -396,6 +468,7 @@ def main(argv=None):
             resources["process_peak_rss_bytes"] = None
         report = {"algorithm": trainer.algorithm, "snapshot": trainer.manifest,
                   "observation_schema": trainer.observation_schema,
+                  "interface": trainer.interface,
                   "scoring_mode": trainer.scoring_mode,
                   "scoring_version": scoring.SCORING_VERSION,
                   "episode_config": trainer.episode_config, "policy_config": trainer.policy_config,

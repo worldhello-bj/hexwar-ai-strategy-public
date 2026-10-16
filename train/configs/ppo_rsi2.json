@@ -1,0 +1,21 @@
+{
+ "note": "迭代第 2 代（RSI）：唯一改动是 baseline_offset=prior_batch_mean —— 把‘席位常数’（蓝 234 / 红 354 的开局分）从优势里减掉，这是 docs/训练困难清单.md 记的头号病根；episodes 提到 320 以放大信号。评测种子与第 1 代相同，便于同种子对比。",
+ "snapshot": "../scenario/7527",
+ "allow_real_map": true,
+ "episodes": 320,
+ "move_radius": 3,
+ "batch_episodes": 8,
+ "max_seconds": 1200,
+ "update_mode": "ppo_clip",
+ "ppo_clip": 0.2,
+ "update_epochs": 4,
+ "buckets": 4096,
+ "hidden_dim": 64,
+ "learning_rate": 0.001,
+ "baseline_offset": "prior_batch_mean",
+ "scoring": "verified",
+ "seed": 0,
+ "eval_seeds": [1000000, 1000001],
+ "checkpoint": "analysis/rsi/gen2_ppo.json",
+ "report": "analysis/rsi/gen2_ppo_report.json"
+}

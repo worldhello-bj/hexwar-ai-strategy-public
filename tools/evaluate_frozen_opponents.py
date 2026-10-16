@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Paired, evaluation-only neural checkpoint matches on synthetic fixtures."""
+"""Paired, evaluation-only neural checkpoint matches.
+
+默认只接受**合成想定**（`origin=original_synthetic`）。要对比在**本地真实想定**上训出的
+检查点（例如 `scenario/7527`），必须显式加 `--allow-real-map`：与 `NeuralTrainer`
+训练同一个 opt-in 口径（`snapshot_manifest(..., allow_real=True)`）。
+"""
 import argparse
 import copy
 import hashlib
@@ -81,7 +86,8 @@ def summarize(games):
                for name in ("a_score", "b_score", "a_score_diff")}}
 
 
-def evaluate(checkpoint_a, checkpoint_b, snapshot, *, seeds, b_initial=False):
+def evaluate(checkpoint_a, checkpoint_b, snapshot, *, seeds, b_initial=False,
+             allow_real=False):
     seeds = list(seeds)
     if not seeds or len(seeds) > 256 or len(set(seeds)) != len(seeds):
         raise ValueError("provide 1 to 256 unique fresh seeds")
@@ -89,7 +95,8 @@ def evaluate(checkpoint_a, checkpoint_b, snapshot, *, seeds, b_initial=False):
         _positive_int("seed", seed, True)
     paths = {"A": Path(checkpoint_a), "B": Path(checkpoint_b)}
     sources = {label: path.read_bytes() for label, path in paths.items()}
-    trainers = {label: NeuralTrainer.load(path, snapshot) for label, path in paths.items()}
+    trainers = {label: NeuralTrainer.load(path, snapshot, allow_real=allow_real)
+                for label, path in paths.items()}
     a, b = trainers.values()
     if a.episode_config != b.episode_config:
         raise ValueError("checkpoint episode contracts differ")
@@ -102,12 +109,12 @@ def evaluate(checkpoint_a, checkpoint_b, snapshot, *, seeds, b_initial=False):
               for label, trainer in trainers.items()}
     frozen = {label: state_hash(model) for label, model in models.items()}
     schemas = {label: trainer.observation_schema for label, trainer in trainers.items()}
-    manifest = snapshot_manifest(snapshot)
+    manifest = snapshot_manifest(snapshot, allow_real=allow_real)
     games = []
     for seed in seeds:
         for side in SIDES:
             games.append(run_game(snapshot, models, schemas, a.episode_config, seed=seed, a_side=side))
-            if snapshot_manifest(snapshot) != manifest:
+            if snapshot_manifest(snapshot, allow_real=allow_real) != manifest:
                 raise RuntimeError("snapshot changed during evaluation")
             if any(state_hash(model) != frozen[label] for label, model in models.items()):
                 raise RuntimeError("frozen model, optimizer or training RNG changed")
@@ -131,7 +138,9 @@ def evaluate(checkpoint_a, checkpoint_b, snapshot, *, seeds, b_initial=False):
                        "mean_a_score_diff": statistics.mean(values) if values else None,
                        "sample_standard_error": statistics.stdev(values) / len(values)**0.5 if len(values) > 1 else None,
                        "pairs": pairs}, "games": games, "frozen_state_and_source_verified": True,
-            "caveat": "Synthetic game only. W/D/L compares raw terminal scores, not tactical rewards. Seat swaps share scenario seeds; policy RNG streams are independent by seat and label. Self-play is symmetric in expectation, not necessarily exact finite-sample wins. Truncations are excluded. Standard error is descriptive over complete seed pairs, not proof of improvement."}
+            "caveat": ("Synthetic game only." if not allow_real else
+                       "Local real-map snapshot (explicit --allow-real-map opt-in).")
+                      + " W/D/L compares raw terminal scores, not tactical rewards. Seat swaps share scenario seeds; policy RNG streams are independent by seat and label. Self-play is symmetric in expectation, not necessarily exact finite-sample wins. Truncations are excluded. Standard error is descriptive over complete seed pairs, not proof of improvement."}
 
 
 def main(argv=None):
@@ -140,6 +149,8 @@ def main(argv=None):
     parser.add_argument("--checkpoint-b", required=True, type=Path)
     parser.add_argument("--b-initial", action="store_true")
     parser.add_argument("--snapshot", required=True, type=Path)
+    parser.add_argument("--allow-real-map", action="store_true",
+                        help="显式允许在本地真实想定（如 scenario/7527）上做对打；默认拒绝")
     parser.add_argument("--seed-start", required=True, type=int)
     parser.add_argument("--seed-count", required=True, type=int)
     parser.add_argument("--report", required=True, type=Path)
@@ -151,7 +162,8 @@ def main(argv=None):
         if args.report.exists() or args.report.resolve() in (args.checkpoint_a.resolve(), args.checkpoint_b.resolve()):
             raise ValueError("choose a new report path distinct from checkpoints")
         report = evaluate(args.checkpoint_a, args.checkpoint_b, args.snapshot,
-                          seeds=range(args.seed_start, args.seed_start + args.seed_count), b_initial=args.b_initial)
+                          seeds=range(args.seed_start, args.seed_start + args.seed_count),
+                          b_initial=args.b_initial, allow_real=args.allow_real_map)
         with args.report.open("x", encoding="utf-8") as stream:
             json.dump(report, stream, indent=2, sort_keys=True, allow_nan=False)
             stream.write("\n")

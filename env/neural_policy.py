@@ -88,15 +88,30 @@ class NeuralPolicy:
         self.m = {k: np.zeros_like(v) for k, v in self.params.items()}
         self.v = {k: np.zeros_like(v) for k, v in self.params.items()}
         self.steps = 0
+        # ★ 特征哈希记忆化（E7）：`emit` 对每个叶子调一次 blake2b，而一次决策要编码
+        #   ~500 个候选 × ~20 个叶子 = 上万次哈希 —— 这是 1 Hz 实时训练的主要成本
+        #   （实测单次决策 22 ms）。`(path, kind, token) → (index, sign)` 是**纯确定性**函数，
+        #   而相邻 tick 的候选大量重复，所以直接缓存；不改任何数值、不碰 RNG。
+        self._emit_cache = {}
+
+    _EMIT_CACHE_LIMIT = 400000
 
     def _features(self, value):
         accumulated = {}
+        cache = self._emit_cache
+
         def emit(path, kind, token=None, amount=1.0):
-            identity = json.dumps([self.config["hash_seed"], path, kind, token],
-                                  ensure_ascii=False, separators=(",", ":"), allow_nan=False)
-            digest = hashlib.blake2b(identity.encode(), digest_size=16).digest()
-            index = int.from_bytes(digest[:8], "little") % self.config["buckets"]
-            sign = 1.0 if digest[8] & 1 else -1.0
+            key = (tuple(map(tuple, path)), kind, token)
+            hit = cache.get(key)
+            if hit is None:
+                identity = json.dumps([self.config["hash_seed"], path, kind, token],
+                                      ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+                digest = hashlib.blake2b(identity.encode(), digest_size=16).digest()
+                hit = (int.from_bytes(digest[:8], "little") % self.config["buckets"],
+                       1.0 if digest[8] & 1 else -1.0)
+                if len(cache) < self._EMIT_CACHE_LIMIT:
+                    cache[key] = hit
+            index, sign = hit
             accumulated[index] = accumulated.get(index, 0.0) + sign * amount
         def visit(item, path):
             if item is None:
@@ -140,6 +155,10 @@ class NeuralPolicy:
     @staticmethod
     def _project(features, weight, bias):
         # One batched sparse projection for all candidate actions.
+        # 注：`np.add.at` 是已知慢路径（实测占 1 Hz 实时训练单局墙钟 ~15%），但换成
+        # `np.add.reduceat` 会改变求和顺序 ⇒ 最后几位不同，而仓库有**逐字节默认算术**
+        # 护栏（`tests/test_neural_ppo.py::test_default_checkpoint_bytes_and_arithmetic_unchanged`），
+        # 为不破坏历史基线的可比性，这里保留原实现。
         sizes = [len(indices) for indices, _ in features]
         rows = np.repeat(np.arange(len(features)), sizes)
         indices = np.concatenate([x[0] for x in features])
