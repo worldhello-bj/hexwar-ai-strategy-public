@@ -89,6 +89,8 @@ FLAGS = {
     "observation_schema": "--observation-schema",
     "baseline_offset": "--baseline-offset",
     "interface": "--interface",
+    "rollout_workers": "--rollout-workers",
+    "policy_seed_mode": "--policy-seed-mode",
     "update_mode": "--update-mode",
     "ppo_clip": "--ppo-clip",
     "update_epochs": "--update-epochs",
@@ -116,7 +118,7 @@ ALLOWED = {
             "max_steps", "buckets", "hidden_dim", "learning_rate",
             "observation_schema", "baseline_offset", "update_mode", "scoring",
             "ppo_clip", "update_epochs", "checkpoint", "resume", "report",
-            "interface", "deploy_window"),
+            "interface", "deploy_window", "rollout_workers", "policy_seed_mode"),
     "eval": ("checkpoint", "snapshot", "seeds", "report", "allow_real_map"),
     "diff": ("snapshot", "radius", "steps"),
 }

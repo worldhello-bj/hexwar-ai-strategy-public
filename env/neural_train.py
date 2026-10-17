@@ -5,6 +5,7 @@ sampler. Only own-seat observations enter the learner. Rewards are the original
 terminal own total, undiscounted, with no shaping or coordinate transformations.
 """
 import argparse
+import concurrent.futures
 import copy
 import hashlib
 import json
@@ -58,6 +59,71 @@ def summary(records):
             **{label: sum(r["result"] == label for r in completed) for label in ("win", "draw", "loss")}}
 
 
+#: 采样随机流的口径：
+#:
+#: * `shared`（历史默认）= **同一条** `policy.rng` 跨局沿用 ⇒ 第 k 局的随机数取决于前面
+#:   跑过多少局，**不能并行**（并行后每局拿到的流位置就变了）。
+#: * `per_episode` = 每局按 `derived_seed(seed, episode_seed, seat, "policy_sample")`
+#:   重新播种 ⇒ **局与局相互独立**，顺序无关，所以可以丢进进程池并行，而且结果可复现。
+POLICY_SEED_MODES = ("shared", "per_episode")
+
+#: 进程池 worker 的公共上下文（每个进程只需初始化一次 snapshot/配置）
+_WORKER_STATE = {}
+
+
+def policy_sample_seed(mode, seed, episode_seed, learner_side):
+    """按采样口径派生该局的策略采样种子（`shared` 口径返回 None ⇒ 不重播种）。"""
+    if mode != "per_episode":
+        return None
+    return derived_seed(seed, episode_seed, learner_side, "policy_sample")
+
+
+class _RolloutRunner:
+    """跑一局所需的**全部不可变上下文**（可 pickle ⇒ 能丢进进程池）。
+
+    `NeuralTrainer._rollout` 现在只是它的委托，所以串行路径的行为**一字未改**；
+    并行路径把同一个对象交给子进程，子进程用同一段代码算。
+    """
+
+    __slots__ = ("snapshot", "manifest", "interface", "episode_config", "observation_schema",
+                 "seed", "entropy_every", "allow_real", "policy_seed_mode")
+
+    def __init__(self, snapshot, manifest, interface, episode_config, observation_schema,
+                 seed, entropy_every, allow_real, policy_seed_mode="shared"):
+        self.snapshot = snapshot
+        self.manifest = manifest
+        self.interface = interface
+        self.episode_config = episode_config
+        self.observation_schema = observation_schema
+        self.seed = seed
+        self.entropy_every = entropy_every
+        self.allow_real = allow_real
+        self.policy_seed_mode = policy_seed_mode
+
+    def sample_seed(self, episode_seed, learner_side):
+        """`per_episode` 口径下该局的采样种子（`shared` 口径返回 None）。"""
+        return policy_sample_seed(self.policy_seed_mode, self.seed, episode_seed, learner_side)
+
+    def rollout(self, policy, episode_seed, learner_side, *, training):
+        # 复用 `NeuralTrainer._rollout` 的**同一份实现**：它只依赖上面这 8 个不可变
+        # 属性，把 runner 实例当 `self` 传进去就是同一段代码（避免两份实现漂移）。
+        return NeuralTrainer._rollout(self, policy, episode_seed, learner_side,
+                                      training=training)
+
+
+def _worker_init(runner):
+    """进程池初始化：每个子进程只接一份不可变上下文（不重算 manifest）。"""
+    _WORKER_STATE["runner"] = runner
+
+
+def _worker_rollout(task):
+    """在子进程里跑一局。策略从检查点状态重建 ⇒ 子进程之间不共享任何可变状态。"""
+    state, episode_seed, learner_side, training = task
+    policy = NeuralPolicy.from_checkpoint(copy.deepcopy(state))
+    return _WORKER_STATE["runner"].rollout(policy, episode_seed, learner_side,
+                                          training=training)
+
+
 class NeuralTrainer:
     """Resumable on-policy batches; incomplete batches survive checkpoints.
 
@@ -68,10 +134,22 @@ class NeuralTrainer:
     def __init__(self, snapshot, *, seed=0, train_seed_start=0, batch_episodes=4,
                  episode_config=None, policy_config=None, heldout_seeds=(1000000, 1000001),
                  observation_schema=1, allow_real=False, scoring_mode="verified",
-                 interface="serial"):
+                 interface="serial", rollout_workers=1, policy_seed_mode=None):
         for name, value in (("seed", seed), ("train_seed_start", train_seed_start)):
             _positive_int(name, value, True)
         _positive_int("batch_episodes", batch_episodes)
+        _positive_int("rollout_workers", rollout_workers)
+        if rollout_workers > 64:
+            raise ValueError("rollout_workers exceeds per-call safety bound")
+        if policy_seed_mode is None:
+            # 并行时必须局间独立，否则同一局的结果取决于并行度 ⇒ 自动选 per_episode。
+            policy_seed_mode = "shared" if rollout_workers <= 1 else "per_episode"
+        if policy_seed_mode not in POLICY_SEED_MODES:
+            raise ValueError("policy_seed_mode must be one of %s" % (POLICY_SEED_MODES,))
+        if rollout_workers > 1 and policy_seed_mode != "per_episode":
+            raise ValueError("rollout_workers>1 requires policy_seed_mode='per_episode'")
+        self.rollout_workers = rollout_workers
+        self.policy_seed_mode = policy_seed_mode
         if scoring_mode not in ("verified", "platform"):
             raise ValueError("scoring_mode must be 'verified' or 'platform'")
         if interface not in INTERFACES:
@@ -133,6 +211,13 @@ class NeuralTrainer:
         opening_own = (status.get("opening_scores") or {}).get(learner_side)
         opponent_rng = random.Random(derived_seed(self.seed, episode_seed, learner_side, "opponent"))
         eval_rng = np.random.default_rng(derived_seed(self.seed, episode_seed, learner_side, "evaluation"))
+        # ★ 采样流口径（`POLICY_SEED_MODES`）：`per_episode` 下每局用一条**局部**流，
+        #   使局与局相互独立 ⇒ 顺序无关、可并行、可复现；策略自身的 `rng` **不动**，
+        #   这样并行与串行的检查点（含 rng 状态）才能逐字节相同。
+        sample_seed = policy_sample_seed(getattr(self, "policy_seed_mode", "shared"),
+                                         self.seed, episode_seed, learner_side)
+        sample_rng = (np.random.default_rng(sample_seed)
+                      if sample_seed is not None else None)
         trajectory, entropies, counts = [], [], []
         decisions = 0
         while not status["terminated"] and not status["truncated"]:
@@ -156,7 +241,11 @@ class NeuralTrainer:
                     if decisions % self.entropy_every == 1:
                         probs = policy.probabilities(observation, candidates)
                         entropies.append(float(-np.sum(probs * np.log(np.maximum(probs, 1e-300)))))
-                    action, decision = policy.sample(observation, candidates)
+                    # 只有 per_episode 口径才传 `rng`：默认（shared）调用形态与历史
+                    # 完全一致（外部测试会用两个参数的桩替换 `policy.sample`）。
+                    action, decision = (policy.sample(observation, candidates)
+                                        if sample_rng is None else
+                                        policy.sample(observation, candidates, rng=sample_rng))
                     trajectory.append(decision)
                 else:
                     probs = policy.probabilities(observation, candidates)
@@ -207,6 +296,18 @@ class NeuralTrainer:
         if any(first <= s < first + episodes for s in self.heldout_seeds):
             raise ValueError("training overlaps reserved heldout seeds")
         records = []
+        if self.rollout_workers > 1:
+            # 一次只并行**同一批**内的局：批内策略是冻结的，所以与串行逐局跑
+            # 得到的是同一个优化序列（更新点、顺序、种子全部一致），只是墙钟变短。
+            with concurrent.futures.ProcessPoolExecutor(
+                    max_workers=self.rollout_workers, initializer=_worker_init,
+                    initargs=(self._runner_context(),)) as pool:
+                while len(records) < episodes:
+                    records.extend(self._train_group(
+                        pool, min(self.rollout_workers,
+                                  episodes - len(records),
+                                  max(1, self.batch_episodes - len(self.pending)))))
+            return records
         for _ in range(episodes):
             index = self.episodes_attempted
             # PPO updates are atomic. Preserve the final rollout's sampling RNG
@@ -215,27 +316,50 @@ class NeuralTrainer:
                        if self.policy.config.get("update_mode") == "ppo_clip" else None)
             record, trajectory = self._rollout(self.policy, self.train_seed_start + index,
                                                SIDES[index % 2], training=True)
-            self.episodes_attempted += 1
-            if record["own_score"] is not None:
-                self.episodes_completed += 1
-                # 学习目标：新记录里叫 `learning_return`（实时接口下=终局分−开局分）；
-                # 老记录/测试桩里没有这个键时退回终局本方分（历史口径）。
-                target = record.get("learning_return")
-                self.pending.append((trajectory, record["own_score"] if target is None else target))
-                if len(self.pending) == self.batch_episodes:
-                    try:
-                        record["update"] = self.policy.update_batch(self.pending)
-                    except (FloatingPointError, OverflowError, ValueError):
-                        if ppo_rng is not None:
-                            self.pending.pop()
-                            self.episodes_attempted -= 1
-                            self.episodes_completed -= 1
-                            self.policy.rng.bit_generator.state = ppo_rng
-                        raise
-                    self.pending.clear()
-                    self.updates += 1
-            records.append(record)
+            records.append(self._absorb(record, trajectory, ppo_rng))
         return records
+
+    def _runner_context(self):
+        return _RolloutRunner(self.snapshot, self.manifest, self.interface,
+                              self.episode_config, self.observation_schema, self.seed,
+                              self.entropy_every, self.allow_real, self.policy_seed_mode)
+
+    def _train_group(self, pool, size):
+        """并行跑 `size` 局（同批、策略冻结），按串行顺序做账。"""
+        base = self.episodes_attempted
+        seeds = [self.train_seed_start + base + i for i in range(size)]
+        sides = [SIDES[(base + i) % 2] for i in range(size)]
+        ppo_rng = (copy.deepcopy(self.policy.rng.bit_generator.state)
+                   if self.policy.config.get("update_mode") == "ppo_clip" else None)
+        state = self.policy.checkpoint()
+        results = list(pool.map(_worker_rollout,
+                                [(state, seed, side, True)
+                                 for seed, side in zip(seeds, sides)]))
+        return [self._absorb(record, trajectory, ppo_rng)
+                for record, trajectory in results]
+
+    def _absorb(self, record, trajectory, ppo_rng):
+        """一局的账：计数 / 入批 / （满批时）更新；串行与并行共用。"""
+        self.episodes_attempted += 1
+        if record["own_score"] is not None:
+            self.episodes_completed += 1
+            # 学习目标：新记录里叫 `learning_return`（实时接口下=终局分−开局分）；
+            # 老记录/测试桩里没有这个键时退回终局本方分（历史口径）。
+            target = record.get("learning_return")
+            self.pending.append((trajectory, record["own_score"] if target is None else target))
+            if len(self.pending) == self.batch_episodes:
+                try:
+                    record["update"] = self.policy.update_batch(self.pending)
+                except (FloatingPointError, OverflowError, ValueError):
+                    if ppo_rng is not None:
+                        self.pending.pop()
+                        self.episodes_attempted -= 1
+                        self.episodes_completed -= 1
+                        self.policy.rng.bit_generator.state = ppo_rng
+                    raise
+                self.pending.clear()
+                self.updates += 1
+        return record
 
     def evaluate(self, seeds=None):
         seeds = self.heldout_seeds if seeds is None else list(seeds)
@@ -243,14 +367,30 @@ class NeuralTrainer:
             raise ValueError("evaluation must use unique reserved heldout seeds")
         before = canonical(self.checkpoint())
         reports = {}
-        for label, checkpoint in (("initial", self.initial_policy), ("trained", self.policy.checkpoint())):
-            policy = NeuralPolicy.from_checkpoint(copy.deepcopy(checkpoint))
-            frozen = canonical(policy.checkpoint())
-            games = [self._rollout(policy, seed, side, training=False)[0] for seed in seeds for side in SIDES]
-            if canonical(policy.checkpoint()) != frozen:
-                raise RuntimeError("evaluation mutated frozen policy")
-            reports[label] = {"summary": summary(games), "by_seat": {
-                side: summary([r for r in games if r["learner_side"] == side]) for side in SIDES}, "games": games}
+        pool = (concurrent.futures.ProcessPoolExecutor(
+            max_workers=self.rollout_workers, initializer=_worker_init,
+            initargs=(self._runner_context(),)) if self.rollout_workers > 1 else None)
+        try:
+            for label, checkpoint in (("initial", self.initial_policy), ("trained", self.policy.checkpoint())):
+                policy = NeuralPolicy.from_checkpoint(copy.deepcopy(checkpoint))
+                frozen = canonical(policy.checkpoint())
+                pairs = [(seed, side) for seed in seeds for side in SIDES]
+                if pool is None:
+                    games = [self._rollout(policy, seed, side, training=False)[0]
+                             for seed, side in pairs]
+                else:
+                    # 评测本身与顺序无关（动作由派生的 `eval_rng` 抽，策略冻结），
+                    # 所以并行结果与串行**逐字段相同**。
+                    state = policy.checkpoint()
+                    games = [row[0] for row in pool.map(
+                        _worker_rollout, [(state, seed, side, False) for seed, side in pairs])]
+                if canonical(policy.checkpoint()) != frozen:
+                    raise RuntimeError("evaluation mutated frozen policy")
+                reports[label] = {"summary": summary(games), "by_seat": {
+                    side: summary([r for r in games if r["learner_side"] == side]) for side in SIDES}, "games": games}
+        finally:
+            if pool is not None:
+                pool.shutdown()
         if canonical(self.checkpoint()) != before:
             raise RuntimeError("evaluation mutated trainer")
         reports["heldout_seeds"] = list(seeds)
@@ -271,6 +411,8 @@ class NeuralTrainer:
             "scoring_mode": self.scoring_mode,
             "interface": self.interface,
             "entropy_every": self.entropy_every,
+            "rollout_workers": self.rollout_workers,
+            "policy_seed_mode": self.policy_seed_mode,
             "snapshot": self.manifest, "seed": self.seed, "train_seed_start": self.train_seed_start,
             "batch_episodes": self.batch_episodes, "episode_config": self.episode_config,
             "policy_config": self.policy_config, "heldout_seeds": self.heldout_seeds,
@@ -284,7 +426,7 @@ class NeuralTrainer:
             stream.write(canonical(self.checkpoint()) + "\n")
 
     @classmethod
-    def load(cls, path, snapshot, *, allow_real=False, interface=None):
+    def load(cls, path, snapshot, *, allow_real=False, interface=None, rollout_workers=None):
         data = json.loads(Path(path).read_text("utf-8"))
         if data.get("schema_version") != 1 or data.get("algorithm") not in ("neural_terminal_reinforce_vs_random", "neural_terminal_ppo_clip_vs_random"):
             raise ValueError("unsupported checkpoint")
@@ -300,6 +442,11 @@ class NeuralTrainer:
         trainer = cls(snapshot, observation_schema=data.get("observation_schema", 1), allow_real=allow_real,
                       scoring_mode=data.get("scoring_mode", "verified"),
                       interface=saved_interface,
+                      # 并行度只是速度旋钮，允许续跑时覆盖；采样口径**不允许**变
+                      # （改了就不是同一条随机实现，训练会失去可比性）。
+                      rollout_workers=(data.get("rollout_workers", 1) if rollout_workers is None
+                                       else rollout_workers),
+                      policy_seed_mode=data.get("policy_seed_mode", "shared"),
                       **{k: data[k] for k in ("seed", "train_seed_start", "batch_episodes",
                                               "episode_config", "policy_config", "heldout_seeds")})
         if trainer.scoring_mode != data.get("scoring_mode", "verified"):
@@ -365,6 +512,13 @@ def main(argv=None):
                         help="对局接口：serial=回合制（旧口径；一次 step 一条指令、时钟整段跳）；"
                              "realtime=1 Hz（每秒双方各一次决策、机动按秒并行推进，与平台同粒度）。"
                              "不传时用检查点里记的那个（新训练默认 serial）。")
+    parser.add_argument("--rollout-workers", type=int, default=None,
+                        help="并行 rollout 的进程数（默认 1 = 串行历史口径；续跑时默认沿用检查点里的值）。"
+                             ">1 时自动改用 policy_seed_mode=per_episode：每局独立播种 ⇒ "
+                             "局与局无关、可并行、结果可复现；并行度不会超过 batch_episodes。")
+    parser.add_argument("--policy-seed-mode", choices=POLICY_SEED_MODES, default=None,
+                        help="采样随机流口径：shared=跨局沿用一条流（历史默认）；"
+                             "per_episode=每局按 (seed, 局种子, 席位) 重新播种（并行必须）")
     parser.add_argument("--buckets", type=int, default=2048)
     parser.add_argument("--hidden-dim", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=0.001)
@@ -403,6 +557,9 @@ def main(argv=None):
             evaluation = trainer.evaluate(list(args.eval_seeds) if args.eval_seeds else None)
             report = {"algorithm": trainer.algorithm, "snapshot": trainer.manifest,
                       "observation_schema": trainer.observation_schema,
+                      "interface": trainer.interface,
+                      "rollout_workers": trainer.rollout_workers,
+                      "policy_seed_mode": trainer.policy_seed_mode,
                       "scoring_mode": trainer.scoring_mode,
                       "scoring_version": scoring.SCORING_VERSION,
                       "episode_config": trainer.episode_config,
@@ -434,11 +591,13 @@ def main(argv=None):
         if args.deep_validate:
             episode_config["deep_validate"] = True
         trainer = NeuralTrainer.load(args.resume, args.snapshot,
-                                    allow_real=args.allow_real_map) if args.resume else NeuralTrainer(
+                                    allow_real=args.allow_real_map,
+                                    rollout_workers=args.rollout_workers) if args.resume else NeuralTrainer(
             args.snapshot, observation_schema=args.observation_schema or 1, seed=args.seed, train_seed_start=args.train_seed_start, batch_episodes=args.batch_episodes,
             heldout_seeds=args.eval_seeds, episode_config=episode_config,
             allow_real=args.allow_real_map, scoring_mode=args.scoring_mode,
             interface=args.interface or "serial",
+            rollout_workers=(args.rollout_workers or 1), policy_seed_mode=args.policy_seed_mode,
             policy_config={"buckets": args.buckets, "hidden_dim": args.hidden_dim, "learning_rate": args.learning_rate,
                            **({"baseline_offset": args.baseline_offset} if args.baseline_offset is not None else {}),
                            **{k: getattr(args, k) for k in ("update_mode", "ppo_clip", "update_epochs") if getattr(args, k) is not None}})
@@ -448,6 +607,9 @@ def main(argv=None):
             raise ValueError("requested scoring mode differs from resumed checkpoint")
         if args.interface is not None and args.interface != trainer.interface:
             raise ValueError("requested interface differs from resumed checkpoint")
+        if (args.policy_seed_mode is not None
+                and args.policy_seed_mode != trainer.policy_seed_mode):
+            raise ValueError("requested policy seed mode differs from resumed checkpoint")
         if (args.baseline_offset is not None and
                 args.baseline_offset != trainer.policy.config.get("baseline_offset", "none")):
             raise ValueError("requested baseline offset differs from resumed checkpoint")
@@ -469,6 +631,8 @@ def main(argv=None):
         report = {"algorithm": trainer.algorithm, "snapshot": trainer.manifest,
                   "observation_schema": trainer.observation_schema,
                   "interface": trainer.interface,
+                  "rollout_workers": trainer.rollout_workers,
+                  "policy_seed_mode": trainer.policy_seed_mode,
                   "scoring_mode": trainer.scoring_mode,
                   "scoring_version": scoring.SCORING_VERSION,
                   "episode_config": trainer.episode_config, "policy_config": trainer.policy_config,

@@ -228,6 +228,9 @@ class Game:
         for u in raw_units:
             uu = Unit(u)
             self.units[uu.id] = uu
+        # ★ 不在这里缓存地形派生量：`hexes` 是公开可变字典（测试/核查脚本会原地改
+        #   `step`/`elevation` 验证规则），按 mapid 缓存会拿到旧值。只保留了
+        #   “cond → 地形名” 这个单标量纯函数的去掉分支优化（见 `_TERRAIN_BY_COND`）。
         # 快照里的「人在车内」记录只有 `pos2`（载具所在格），必须在载入时把关系
         # 固定到**载具 ID** 上；否则载具一机动，`pos2` 变旧格，载员的分值就会
         # 从计分里凭空消失（等于惩罚机动）。见 `docs/计分规则待确认.md`。
@@ -702,8 +705,14 @@ class Game:
         return 1 if self.started else ""
 
     # ---------------- 地形 / 通行 ----------------
+    # 格的 `cond` → 地形类别（纯函数，只依赖一个标量）。
+    # ★ 不要按 mapid 缓存整个格字典：`hexes` 是公开可变字典（测试与核查脚本会
+    #   原地改 `step`/`elevation` 来验证规则），按 mapid 缓存会拿到旧值。
+    #   这里只去掉重复的分支判类，取值与直算**完全相同**。
+    _TERRAIN_BY_COND = {7: "居民地", 6: "过河", 8: "丛林地", 9: "丛林地"}
+
     def hex(self, mapid):
-        return self.hexes.get(int(mapid))
+        return self.hexes.get(mapid if type(mapid) is int else int(mapid))
 
     def elevation(self, mapid):
         h = self.hex(mapid)
@@ -719,29 +728,21 @@ class Game:
         return h + (u.alt or 0) if u.typeid == 3 else h
 
     def terrain_kind(self, mapid):
-        """粗略地形类别（由 cond / note 推断）。"""
+        """粗略地形类别（由 cond 推断）。"""
         h = self.hex(mapid)
         if not h:
             return None
-        cond = int(h.get("cond") or 0)
-        note = h.get("note") or ""
-        if cond == 7:
-            return "居民地"
-        if cond == 6:
-            return "过河"
-        if cond in (8, 9):
-            return "丛林地"
-        return None
+        return self._TERRAIN_BY_COND.get(int(h.get("cond") or 0))
 
     def passable(self, mapid, unit):
         h = self.hex(mapid)
-        if not h:
+        if h is None:
             return False, "地图外"
         step = int(h.get("step") or 0)
         if step == 0:
             return False, "禁行区"
-        terr = self.terrain_kind(mapid)
         if unit.typeid == 2:
+            terr = self._TERRAIN_BY_COND.get(int(h.get("cond") or 0))
             if terr == "过河":
                 return False, "车辆不可跨越水系"
             if step == -1 and unit.c0 != 2:
@@ -752,20 +753,23 @@ class Game:
         """返回进入 to_id 一格所需秒数（客户端会 ×1000 作为动画时长）。"""
         if not unit.alive() or unit.detail.get("carrier"):
             return 0, "单位不能独立移动"
-        if not self.hex(from_id) or G.distance(from_id, to_id) != 1:
+        if self.hex(from_id) is None or G.distance(from_id, to_id) != 1:
             return 0, "必须移动到相邻格"
         ok, why = self.passable(to_id, unit)
         if not ok:
             return 0, why
+        hto = self.hex(to_id)          # `passable` 已确认非空，直接取派生字段
+        to_ele = int(hto["elevation"])
+        terr = self._TERRAIN_BY_COND.get(int(hto.get("cond") or 0))
+        to_note = hto.get("note") or ""
         base = {1: 60.0, 2: 12.0, 3: 6.0, 4: 999.0}.get(unit.typeid, 60.0)
-        terr = self.terrain_kind(to_id)
         # 手册 4.6.3(1)：人员被压制后不能机动；需等压制解除后才能继续（4.1.1(6)）。
         if unit.typeid in (1, 2) and unit.stunned(self.second):
             return 0, "被压制不能机动"
         if unit.typeid == 1:
             if terr == "过河":
                 base *= 2.0            # 手册 4.1.1(1) 步兵过河降为 1/2
-            dh = abs(self.elevation(to_id) - self.elevation(from_id))
+            dh = abs(to_ele - self.elevation(from_id))
             if dh // 20 >= 4:
                 base *= 2.0            # 手册 4.1.1(3) 坡度等级 ≥4 → 1/2 速
             if unit.ste == 4:          # 手册 4.1.1(4) 冲锋 = 越野速度 4 倍
@@ -773,8 +777,7 @@ class Game:
                     return 0, "疲劳状态下不能继续冲锋（手册 4.1.1(4)）"
                 base /= 4.0
         elif unit.typeid == 2:
-            note = (self.hex(to_id) or {}).get("note") or ""
-            if note in self.ROAD_NOTES:
+            if to_note in self.ROAD_NOTES:
                 # 手册 4.1.2(4)：沿道路行驶，速度不受地形和高差影响
                 #（同时豁免 4.1.2(3) 的高差减速与 >100 米禁行）
                 pass
@@ -783,7 +786,7 @@ class Game:
                     base *= 2.0            # 手册 4.1.2(1)
                 elif terr == "居民地":
                     base *= 3.0
-                dh = abs(self.elevation(to_id) - self.elevation(from_id))
+                dh = abs(to_ele - self.elevation(from_id))
                 if dh > 100:
                     return 0, "高差>100 米，车辆无法进入并通过（手册 4.1.2(3)）"
                 lvl = dh // 20
@@ -791,12 +794,16 @@ class Game:
                     base *= (lvl + 1)
         # 堆叠限制：同格本方地面单位不超过 4
         # 手册 4.2：同格本方地面单位不可超过 4 个（已上车的步兵不占格位）
-        n = sum(1 for u in self.units.values()
-                if u.alive() and u.color == unit.color and u.pos == to_id
-                and u.typeid in (1, 2) and u.id != unit.id
-                and not u.detail.get("carrier"))
-        if n >= 4:
-            return 0, "违反堆叠规则"
+        # ★ 判据顺序与提前退出只是优化：先比 `pos`（绝大多数单位直接落空），
+        #   数到 4 就够了 —— 与 `sum(...) >= 4` 的结论完全一致。
+        n = 0
+        for u in self.units.values():
+            if (u.pos == to_id and u.blood > 0 and u.color == unit.color
+                    and u.typeid in (1, 2) and u.id != unit.id
+                    and not u.detail.get("carrier")):
+                n += 1
+                if n >= 4:
+                    return 0, "违反堆叠规则"
         return base, ""
 
     def commit_step(self, unit, from_id, to_id):

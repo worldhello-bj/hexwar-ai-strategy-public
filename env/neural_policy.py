@@ -216,10 +216,29 @@ class NeuralPolicy:
     def probabilities(self, observation, candidates):
         return self._forward(self._decision(observation, candidates))[3]
 
-    def sample(self, observation, candidates):
+    #: `_loss_gradients` 每次只保留这么多条样本的 forward（见那里的分块说明）。
+    #: 量级按“每决策 ~1 MB”估：64 条约 64 MB，既控内存又保留批量矩阵运算的效率。
+    GRADIENT_CHUNK = 64
+
+    def _value(self, decision):
+        """只算值头：与 `_forward(...)[4]` **同一条表达式**、同一投影，数值相同。
+
+        仅用于“需要先拿全部 value 才能算优势”的老口径（reinforce）；PPO 走的是
+        冻结的 `advantages`，不会调用它。
+        """
+        obs = self._project((decision.observation,), self.params["observation"],
+                            self.params["observation_bias"])[0]
+        return float(obs @ self.params["value"] + self.params["value_bias"][0])
+
+    def sample(self, observation, candidates, rng=None):
+        """按策略分布抽一个候选。
+
+        `rng` 可选：传入则用这条**局部**随机流（并行 rollout 的 per-episode 口径就靠它，
+        这样不持有/不改写策略自己的 `rng`）；不传则用策略自身的流（历史口径）。
+        """
         record = self._decision(observation, candidates)
         probs = self._forward(record)[3]
-        index = int(self.rng.choice(len(candidates), p=probs))
+        index = int((self.rng if rng is None else rng).choice(len(candidates), p=probs))
         return candidates[index], Decision(record.observation, record.candidates, index)
 
     def select(self, observation, candidates):
@@ -246,15 +265,30 @@ class NeuralPolicy:
         # These residual targets are internal critic targets, not changed returns.
         if baseline_offset != 0.0:
             examples = [(d, score - baseline_offset) for d, score in examples]
-        forward = [self._forward(d) for d, _ in examples]
+        # ★ 分块（E7）：原来先把**整个 batch** 的 forward 全算出来再回传梯度。
+        #   1 Hz 实时接口下一局 1200 次决策、每次 ~500 候选，每个 forward 约 1 MB
+        #   （`joint` 是 候选数×3h 的 float64）⇒ batch 4 一次就要 ~4.8 GB，实测会把
+        #   内存/GC 拖到看起来"卡死"。这里按块算、按块回传：梯度与 loss 都是**按样本
+        #   顺序**累加的，分块只是把同一顺序切成若干段，数值**逐字节不变**
+        #   （`tests/test_neural_ppo.py` 对着独立旧实现校验）。
         if advantages is None:
-            advantages = [score - f[4] for (_, score), f in zip(examples, forward)]
+            # 优势要用 value，而 value 只依赖观察投影 + 值头 ⇒ 走轻量取值，
+            # 不必为这一步先算一遍完整的动作投影。
+            advantages = [score - self._value(d) for d, score in examples]
         if old_log_probs is not None:
             if len(old_log_probs) != count or len(advantages) != count or not np.isfinite(old_log_probs).all() or not np.isfinite(advantages).all():
                 raise ValueError("invalid frozen PPO batch")
         loss = 0.0
         h = self.config["hidden_dim"]
-        for i, ((decision, score), adv, f) in enumerate(zip(examples, advantages, forward)):
+        forward, forward_start = [], 0
+        for i, (decision, score) in enumerate(examples):
+            if not (forward_start <= i < forward_start + len(forward)):
+                # 只保留这一块的 forward（见上面的分块说明）：样本顺序不变 ⇒ 数值不变
+                forward_start = i
+                forward = [self._forward(d)
+                           for d, _ in examples[i:i + self.GRADIENT_CHUNK]]
+            f = forward[i - forward_start]
+            adv = advantages[i]
             obs, actions, joint, probs, value, log_probs = f
             actor_weight = adv
             if old_log_probs is None:
@@ -296,8 +330,16 @@ class NeuralPolicy:
             np.add.at(gradients["observation"], indices, values[:, None] * dobs)
             gradients["observation_bias"] += dobs
             gradients["action_bias"] += dactions.sum(axis=0)
-            for (indices, values), derivative in zip(decision.candidates, dactions):
-                np.add.at(gradients["action"], indices, values[:, None] * derivative)
+            # ★ 加速（E7）：原来**每个候选一次** `np.add.at`，真实地图上一次决策就有
+            #   ~500 个候选 ⇒ 单次更新要发 18 万次 ufunc.at（实测占 update_batch 的 78%）。
+            #   这里把同一决策的候选拼成一次调用：`ufunc.at` 对重复下标**按出现顺序**
+            #   累加，而拼接保持了「候选顺序 × 候选内特征顺序」，所以累加序列逐项不变 ⇒
+            #   结果**逐字节相同**（`tests/test_neural_ppo.py` 里对着独立旧实现校验）。
+            if decision.candidates:
+                np.add.at(gradients["action"],
+                          np.concatenate([row[0] for row in decision.candidates]),
+                          np.concatenate([row[1][:, None] * derivative for row, derivative
+                                          in zip(decision.candidates, dactions)]))
         return float(loss), gradients
 
     def update_batch(self, trajectories):
