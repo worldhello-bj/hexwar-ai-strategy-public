@@ -116,6 +116,11 @@ class HexwarEnv:
         self.game = None
         self.done = False
         self._history = []
+        # ★ 可见性快照（E7）：`can_observe(o, t)` 只依赖单位的这几个字段，而同一状态里
+        #   `observe()` 与 `_remember()` 会把**同一批** O(单位²) 通视重算 4 遍。
+        #   这里用状态指纹把关：指纹一变就整张丢掉 ⇒ 不会拿到陈旧结果。
+        self._vis = {}
+        self._vis_key = None
 
     # ---------------- 生命周期 ----------------
     def reset(self, seed=None):
@@ -125,18 +130,52 @@ class HexwarEnv:
         self.game.second = 0
         self.done = False
         self._history = []
+        self._vis = {}
+        self._vis_key = None
         self._remember()
         self._check_done()
         return self.observe()
 
+    def _visibility_key(self):
+        """`Game.can_observe` 真正依赖的字段快照（变了就应该重算可见性）。"""
+        g = self.game
+        return (g.second,
+                tuple((u.id, u.pos, u.blood, u.ste, u.color, u.alt,
+                       bool(u.detail.get("carrier")),
+                       bool(u.detail.get("hidden")),
+                       bool(u.detail.get("out_of_control")))
+                      for u in g.units.values()))
+
+    def _sync_visibility(self):
+        # ★ 如果 `can_observe` 被**替换**过（测试常这么做：`patch.object(game, 'can_observe')`），
+        #   状态指纹不会变，但实现变了 —— 这时候必须完全关掉缓存，否则会拿到旧实现的结果。
+        #   `Game` 没有 `__slots__`，所以被 patch 时类方法会落到实例 `__dict__` 里。
+        if "can_observe" in self.game.__dict__:
+            self._vis_key, self._vis = None, {}
+            return
+        key = self._visibility_key()
+        if key != self._vis_key:
+            self._vis_key = key
+            self._vis = {}
+
+    def _can_observe(self, observer_id, target_id):
+        """同一状态内的 `Game.can_observe` 快照（结果与直接调用完全一致）。"""
+        key = (observer_id, target_id)
+        hit = self._vis.get(key)
+        if hit is None:
+            hit = self.game.can_observe(observer_id, target_id)
+            self._vis[key] = hit
+        return hit
+
     def _remember(self):
         """记住当前可见的敌方（形成「已知但可能过期」的情报）。"""
+        self._sync_visibility()
         for u in self.game.units.values():
             if u.color == self.side or not u.alive():
                 continue
             if self.fog and not any(
                     o.alive() and o.color == self.side and
-                    self.game.can_observe(o.id, u.id)
+                    self._can_observe(o.id, u.id)
                     for o in self.game.units.values()):
                 continue
             self._history.append({"t": self.game.second, "id": u.id,
@@ -197,6 +236,7 @@ class HexwarEnv:
 
     def observe(self):
         g = self.game
+        self._sync_visibility()
         own, seen = [], []
         for u in g.units.values():
             if not u.alive():
@@ -205,7 +245,7 @@ class HexwarEnv:
                 own.append(self._unit_view(u))
             else:
                 visible = (not self.fog) or any(
-                    self.game.can_observe(o.id, u.id)
+                    self._can_observe(o.id, u.id)
                     for o in g.units.values()
                     if o.alive() and o.color == self.side)
                 if visible:
