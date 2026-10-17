@@ -1,7 +1,0 @@
-{
- "note": "评测配置：在比赛初设 7527 上、同一批种子对比初始策略与训练后策略。检查点用命令行传（--checkpoint ...）",
- "snapshot": "../scenario/7527",
- "allow_real_map": true,
- "seeds": [1000000, 1000001],
- "report": "analysis/realmap/eval.json"
-}
