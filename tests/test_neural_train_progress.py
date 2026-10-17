@@ -101,6 +101,16 @@ class ProgressLedgerTests(unittest.TestCase):
         self.assertLess(report["overall_rate_per_min"], 0.1)
         self.assertAlmostEqual(report["eta_minutes"], (100 - 11) / 2.0)
 
+    def test_rate_needs_minimum_span(self):
+        """同一批几局在毫秒内落盘时不能算出天文数字速率（实际踩过 110473 局/min）。"""
+        rows = [{"wall": 1000.0 + 0.02 * i, "attempted": i + 1, "completed": i + 1,
+                 "updates": 0, "own": 300.0, "R": 1.0, "result": "win",
+                 "decisions": 20, "episode_seconds": 5.0} for i in range(3)]
+        report = summarize(rows, total=100, window=50, now=1000.1)
+        self.assertIsNone(report["rate_per_min"])
+        self.assertIsNone(report["eta_minutes"])
+        self.assertEqual(report["done"], 3)
+
     def test_empty_ledger_says_so(self):
         report = summarize([], total=10)
         self.assertEqual(report["done"], 0)

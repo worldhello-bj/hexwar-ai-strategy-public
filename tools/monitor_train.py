@@ -36,7 +36,7 @@ def read_rows(path):
     return rows
 
 
-def summarize(rows, total, window=50, now=None, gap_limit=300.0):
+def summarize(rows, total, window=50, now=None, gap_limit=300.0, min_span=30.0):
     """把台账整理成一块可直接读的报告（纯函数，便于测试）。
 
     ★ 速率/ETA 只放**近期窗口**（最后 `window` 行）：长跑中间可能因故停了几个小时
@@ -52,7 +52,7 @@ def summarize(rows, total, window=50, now=None, gap_limit=300.0):
     last_wall = rows[-1].get("wall")
     overall = None
     if (first_wall is not None and last_wall is not None
-            and last_wall > first_wall and done > 1):
+            and last_wall > first_wall and done > 1 and (last_wall - first_wall) >= min_span):
         overall = (done - 1) / ((last_wall - first_wall) / 60.0)
     # ★ 只看**尾部连续段**：相邻两行相隔超过 `gap_limit` 秒就当成中断
     #   （终端被清理、机器休眠、手动暂停……）。否则一次 4.7 h 的停机能把 ETA 从
@@ -68,7 +68,9 @@ def summarize(rows, total, window=50, now=None, gap_limit=300.0):
     rate = None
     if len(tail_rows) >= 2:
         span = tail_rows[-1].get("wall", 0) - tail_rows[0].get("wall", 0)
-        if span > 0:
+        # ★ 同一批的几局会在毫秒级内一起落盘，跨度过小会把速率算成天文数字
+        #   ⇒ 不足 `min_span` 秒就干脆不给速率/ETA（显示 —）。
+        if span >= min_span:
             rate = (len(tail_rows) - 1) / (span / 60.0)
     eta = None
     if rate and total:
