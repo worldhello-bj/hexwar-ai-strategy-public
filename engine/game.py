@@ -7,6 +7,7 @@
 - 直瞄射击由 com/Attack.asp 裁决，结果通过下一帧 ObjAjax 下发（血量/压制变化）。
 """
 import os
+import copy
 import json
 import math
 import time
@@ -400,7 +401,7 @@ class Game:
                                 % (u.army or u.name))
             if u.fatigued_until and u.fatigued_until <= now:
                 u.fatigued_until = 0.0
-            if u.detail.get("path") and not u.stunned(now):
+            if u.detail.get("path") or u.detail.get("move_to") is not None:
                 self._resume_path(u, now)
         self._update_dependencies()
         self._expire_missiles(now)
@@ -410,49 +411,89 @@ class Game:
         """登记一条机动路径（相邻格序列）。
 
         手册 4.1.1(6)：机动中遭压制 → 完成当前格后停止，压制解除后**继续执行**
-        未完成的机动。登记后由 `_resume_path` 在每次 tick 推进一格。
+        未完成的机动。登记时提交首格耗时；`_resume_path` 在到期 tick 完成该格，
+        然后提交下一格。活动格不可重发改令重置截止时间；stop 可取消。
         """
         u = self.units.get(unit_id)
         if not u:
             return False, "棋子不存在"
-        u.detail["path"] = [int(x) for x in path]
+        if float(u.detail.get("move_until", 0)) > self.second:
+            return False, "当前机动格尚未完成"
+        if not u.alive() or u.detail.get("carrier"):
+            return False, "单位不能机动"
+        if not path:
+            return False, "机动路径为空"
+        new_path = [int(x) for x in path]
+        # Validate before registering an order; rejected input is a no-op.
+        sec, why = self.step_seconds(u, u.pos, new_path[0])
+        if sec <= 0:
+            return False, why
+        u.detail["path"] = new_path
         u.detail["path_idx"] = 0
-        u.detail["move_until"] = 0          # 新指令：清掉上一条路径遗留的到达时刻
+        self._resume_path(u, self.second)
         return True, ""
 
     def pending_moves(self):
-        """仍有未完成机动路径的单位 id 列表。"""
-        return [u.id for u in self.units.values() if u.detail.get("path")]
+        """Units with a queued path or an outstanding timed leg."""
+        return [u.id for u in self.units.values()
+                if u.detail.get("path") or u.detail.get("move_to") is not None]
+
+    def cancel_move(self, unit_id):
+        """Stop at the recorded position; elapsed time/start costs are not refunded.
+
+        A fresh order pays a full leg. In particular, commit_step charge fatigue
+        is committed once at departure and is not erased by cancellation.
+        """
+        u = self.units.get(unit_id)
+        if u is None:
+            return False
+        for key in ("path", "path_idx", "move_until", "move_to"):
+            u.detail.pop(key, None)
+        u.pos2 = u.pos
+        return True
 
     def _resume_path(self, u, now):
+        if not u.alive() or u.detail.get("carrier"):
+            self.cancel_move(u.id)
+            return
+        # Finish a started leg even under suppression, then pause the next leg.
+        if u.detail.get("move_to") is not None:
+            if now < u.detail.get("move_until", 0):
+                return
+            # Revalidate current board/stacking rules without charging again.
+            # Suppression/fatigue gained during the leg must not undo that leg;
+            # they gate only the next leg, per the existing resume contract.
+            arrival_unit = copy.copy(u)
+            arrival_unit.stunned_until = arrival_unit.fatigued_until = 0
+            allowed, why = self.step_seconds(arrival_unit, u.pos, u.detail["move_to"])
+            if allowed <= 0:
+                self.record("%s 到达受阻：%s" % (u.army or u.name, why))
+                self.cancel_move(u.id)
+                return
+            u.pos = u.pos2 = u.detail.pop("move_to")
+            u.detail.pop("move_until", None)
+            u.detail["path_idx"] = u.detail.get("path_idx", 0) + 1
+            for passenger in self.units.values():
+                if passenger.detail.get("carrier") == u.id:
+                    passenger.pos = passenger.pos2 = u.pos
+            self.apply_city_capture(u)
+            self.record("%s 机动到达 %d" % (u.army or u.name, u.pos))
         path = u.detail.get("path") or []
         i = u.detail.get("path_idx", 0)
         if i >= len(path):
-            u.detail.pop("path", None)
-            u.detail.pop("path_idx", None)
-            u.detail.pop("move_until", None)
+            self.cancel_move(u.id)
             return
-        # ★ 按**秒**推进：本格还没走完就不动。缺这道门，推进速度会变成
-        #   “每个调用一格”（实测 60 秒里 60 次调用走 8 格，而规则是 60 秒/格）。
-        if now < u.detail.get("move_until", 0):
+        if u.stunned(now):
             return
         to_id = path[i]
-        sec, why = self.step_seconds(u, u.pos, to_id)
+        sec, why = self.commit_step(u, u.pos, to_id)
         if sec <= 0:
-            if "被压制" in why:
-                return                       # 仍在压制中，等下一 tick
             self.record("%s 无法继续机动：%s" % (u.army or u.name, why))
-            u.detail.pop("path", None)
-            u.detail.pop("path_idx", None)
-            u.detail.pop("move_until", None)
+            self.cancel_move(u.id)
             return
-        u.pos = to_id
+        u.detail["move_to"] = to_id
         u.detail["move_until"] = now + sec
-        u.detail["path_idx"] = i + 1
-        if i + 1 >= len(path):
-            u.detail.pop("path", None)
-            u.detail.pop("path_idx", None)
-        self.record("%s 机动至 %d（%.0f 秒）" % (u.army or u.name, to_id, sec))
+        u.pos2 = to_id
 
     def _update_dependencies(self):
         """手册 4.9(3)：无人战车所属有人战车被摧毁 → 失控（不能射击/侦察/校射）。"""
@@ -675,7 +716,7 @@ class Game:
     @staticmethod
     def _clear_missile_actions(m):
         """消耗/损失后不得继续移动、侦察或重复攻击：清掉机动路径与持续打击。"""
-        for key in ("path", "path_idx", "move_until", "target", "target_weapon"):
+        for key in ("path", "path_idx", "move_until", "move_to", "target", "target_weapon"):
             m.detail.pop(key, None)
         m.pos2 = m.pos
 

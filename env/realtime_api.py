@@ -264,13 +264,28 @@ class RealtimeEpisode:
                 continue
             busy = float(u.detail.get("busy_until", 0)) > now
             if kind == "move":
+                if busy or float(u.detail.get("move_until", 0)) > now:
+                    continue
                 act = dict(act)
                 act.pop("seconds", None)   # 持续指令：不按"整条路径耗时"计，改按秒推进
                 out.append(act)
+            elif kind in ("load", "unload"):
+                participants = self._transport_participants(authoritative, act)
+                if all(p is not None and float(p.detail.get("busy_until", 0)) <= now
+                       for p in participants):
+                    out.append(act)
             elif kind == "launch":
                 # 发射要等**弹**的部署动作做完（占用记在弹上）：上车那一秒不能同秒发射。
                 m = authoritative.game.units.get(act.get("missile"))
-                if m is not None and float(m.detail.get("busy_until", 0)) <= now:
+                if (not busy and m is not None
+                        and float(m.detail.get("busy_until", 0)) <= now):
+                    out.append(act)
+            elif kind == "area_fire":
+                participants = [authoritative.game.units.get(uid)
+                                for uid in act.get("units", [u.id])]
+                if all(p is not None and p.color == side
+                       and float(p.detail.get("busy_until", 0)) <= now
+                       for p in participants):
                     out.append(act)
             elif kind == "stop":
                 pass                       # 见下面的显式生成（`raw` 里的 stop 是回合制语义的）
@@ -281,12 +296,21 @@ class RealtimeEpisode:
         # 注意不能依赖 `raw` 里的 stop —— 那是回合制语义（只在 `pos2 != pos` 时给），
         # 而实时语义下状态存在 `move_until`（本段机动的到达时刻）里。
         for u in sorted(authoritative.game.units.values(), key=lambda x: str(x.id)):
-            if u.color != side or u.detail.get("carrier"):
+            if not u.alive() or u.color != side or u.detail.get("carrier"):
                 continue
             if (u.detail.get("path") or u.detail.get("target")
                     or float(u.detail.get("move_until", 0)) > now):
                 out.append({"type": "stop", "unit": u.id})
         return out
+
+    @staticmethod
+    def _transport_participants(env, action):
+        """Snapshot participants before transport changes carrier membership."""
+        g = env.game
+        u = g.units.get(action["unit"])
+        if action["type"] == "load":
+            return [u, g.units.get(action.get("carrier"))]
+        return [u] + env._disembarkable(g, u)
 
     # ---------------- 执行 ----------------
     def step(self, action, *, side=None):
@@ -337,14 +361,16 @@ class RealtimeEpisode:
                 raise ValueError(why or "move order rejected")
             return
         if kind == "stop":
-            u.detail.pop("path", None)
-            u.detail.pop("path_idx", None)
-            u.detail.pop("move_until", None)
+            g.cancel_move(u.id)
             u.detail.pop("target", None)
             u.detail.pop("target_weapon", None)
             u.pos2 = u.pos
             return
         # 其余动作复用 `HexwarEnv._apply`（保证规则只有一份），用它的耗时作为**单位占用**
+        # Unload removes passengers from the carrier list. Capture the complete
+        # participant set first so the existing action cost applies to them too.
+        transport_participants = (self._transport_participants(env, action)
+                                  if kind in ("load", "unload") else None)
         cost = None
         if kind == "attack" and action.get("track"):
             _, _, _, info = env._apply(action)
@@ -357,7 +383,13 @@ class RealtimeEpisode:
                 raise ValueError(info.get("msg") or "order rejected")
             cost = max(0, info.get("seconds", 0))
         if cost:
-            u.detail["busy_until"] = g.second + cost
+            participants = ([p.id for p in transport_participants]
+                            if transport_participants is not None else
+                            action.get("units", [u.id]) if kind == "area_fire" else [u.id])
+            for uid in participants:
+                participant = g.units.get(uid)
+                if participant is not None:
+                    participant.detail["busy_until"] = g.second + cost
             if kind == "launch":
                 # 发射要同时占住**载车**与**弹**：载车这一秒不能再下令
                 # （它要完成发射动作），弹也要等发射完成才能开始机动/攻击。
