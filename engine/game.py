@@ -749,8 +749,25 @@ class Game:
                 return False, "车辆禁行"
         return True, ""
 
-    def step_seconds(self, unit, from_id, to_id):
-        """返回进入 to_id 一格所需秒数（客户端会 ×1000 作为动画时长）。"""
+    def stack_index(self):
+        """`(color, pos) → 地面单位数`（typeid 1/2、存活、未上车）。
+
+        ★ 只读快照，**不缓存在 Game 上**：调用方（如枚举的机动 BFS）自己一次成型、
+        自己保证“期间没有位移”，所以不可能拿到陈旧值。等价于 `step_seconds`
+        每次现场扫全部单位数一遍，只是从 O(单位数) 降成 O(1)。
+        """
+        idx = {}
+        for u in self.units.values():
+            if u.blood > 0 and u.typeid in (1, 2) and not u.detail.get("carrier"):
+                key = (u.color, u.pos)
+                idx[key] = idx.get(key, 0) + 1
+        return idx
+
+    def step_seconds(self, unit, from_id, to_id, stack=None):
+        """返回进入 to_id 一格所需秒数（客户端会 ×1000 作为动画时长）。
+
+        `stack` 可选：调用方预先用 `stack_index()` 做好的位置快照；不传则现场数。
+        """
         if not unit.alive() or unit.detail.get("carrier"):
             return 0, "单位不能独立移动"
         if self.hex(from_id) is None or G.distance(from_id, to_id) != 1:
@@ -796,14 +813,22 @@ class Game:
         # 手册 4.2：同格本方地面单位不可超过 4 个（已上车的步兵不占格位）
         # ★ 判据顺序与提前退出只是优化：先比 `pos`（绝大多数单位直接落空），
         #   数到 4 就够了 —— 与 `sum(...) >= 4` 的结论完全一致。
-        n = 0
-        for u in self.units.values():
-            if (u.pos == to_id and u.blood > 0 and u.color == unit.color
-                    and u.typeid in (1, 2) and u.id != unit.id
-                    and not u.detail.get("carrier")):
-                n += 1
-                if n >= 4:
-                    return 0, "违反堆叠规则"
+        if stack is None:
+            n = 0
+            for u in self.units.values():
+                if (u.pos == to_id and u.blood > 0 and u.color == unit.color
+                        and u.typeid in (1, 2) and u.id != unit.id
+                        and not u.detail.get("carrier")):
+                    n += 1
+                    if n >= 4:
+                        return 0, "违反堆叠规则"
+            return base, ""
+        n = stack.get((unit.color, to_id), 0)
+        if (unit.pos == to_id and unit.blood > 0 and unit.typeid in (1, 2)
+                and not unit.detail.get("carrier")):
+            n -= 1                      # 索引里包含自己，旧口径是 `u.id != unit.id`
+        if n >= 4:
+            return 0, "违反堆叠规则"
         return base, ""
 
     def commit_step(self, unit, from_id, to_id):

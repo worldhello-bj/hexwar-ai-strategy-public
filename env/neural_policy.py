@@ -101,7 +101,10 @@ class NeuralPolicy:
         cache = self._emit_cache
 
         def emit(path, kind, token=None, amount=1.0):
-            key = (tuple(map(tuple, path)), kind, token)
+            # `path` 已经是**不可变元组**（由 `visit` 增量拼接得到），所以不再每次
+            # 都做 `tuple(map(tuple, path))` —— 键的取值与原来逐元素相同，
+            # `json.dumps` 对元组/列表输出的字节也相同 ⇒ 特征下标不变。
+            key = (path, kind, token)
             hit = cache.get(key)
             if hit is None:
                 identity = json.dumps([self.config["hash_seed"], path, kind, token],
@@ -130,14 +133,14 @@ class NeuralPolicy:
                     raise ValueError("JSON object keys must be strings")
                 emit(path, "object")
                 for key in sorted(item):
-                    visit(item[key], path + [["key", key]])
+                    visit(item[key], path + (("key", key),))
             elif isinstance(item, list):
                 emit(path, "array")
                 for index, child in enumerate(item):
-                    visit(child, path + [["index", index]])
+                    visit(child, path + (("index", index),))
             else:
                 raise ValueError("features require JSON values")
-        visit(value, [])
+        visit(value, ())
         # Generic input norm controls saturation without altering returns.
         keys = np.array(sorted(accumulated), dtype=np.int64)
         values = np.array([accumulated[k] for k in keys], dtype=np.float64)

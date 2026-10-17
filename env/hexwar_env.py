@@ -309,6 +309,9 @@ class HexwarEnv:
                  if u.alive() and u.color == self.side
                  and not u.detail.get("carrier")      # 已上车的不再独立行动
                  and (unit_id is None or u.id == unit_id)]
+        # ★ 堆叠计数快照：枚举期间只读、不会位移，所以一次成型交给 `step_seconds`
+        #   （原来每次 step_seconds 都现场扫 36 个单位，而一次列举要调 600+ 次）。
+        stack = g.stack_index()
         for u in units:
             if u.stunned(g.second):
                 continue
@@ -321,7 +324,7 @@ class HexwarEnv:
                     for nb in G.neighbors(cur):
                         if nb in seenpos:
                             continue
-                        sec, _why = g.step_seconds(u, cur, nb)
+                        sec, _why = g.step_seconds(u, cur, nb, stack=stack)
                         if sec <= 0:
                             continue
                         seenpos.add(nb)
@@ -338,11 +341,17 @@ class HexwarEnv:
                     continue
                 d = G.distance(u.pos, t.pos)
                 picked = None
+                # ★ 通视/可观察只取决于 **(u, t) 这一对**，与武器无关 —— 原来这句放在
+                #   `for wid in u.wz` 里，等价于同一对单位重复算 2–4 遍。
+                #   改成“第一次真的需要时才算、之后复用”，结果完全一致（`can_observe` 无副作用）。
+                visible = None
                 for wid in u.wz:
                     w = WEAPONS.get(wid)
                     if not w or d > w[2]:
                         continue
-                    if not g.can_observe(u.id, t.id):
+                    if visible is None:
+                        visible = g.can_observe(u.id, t.id)
+                    if not visible:
                         continue
                     acts.append({"type": "attack", "unit": u.id, "target": t.id,
                                  "weapon": wid, "dist": d, "weapon_name": w[0],
@@ -406,13 +415,20 @@ class HexwarEnv:
                      and (unit_id is None or u.id == unit_id)]
         hexes = {t.pos for t in g.units.values()
                  if t.alive() and t.color != self.side and t.pos}
+        # ★ 每个格子只取**第一个**敌方单位做代表（原实现是在 (格 × 己方单位) 的
+        #   二重循环里跑一遍生成器，等价于每对重复扫描全部单位）。
+        #   取第一个 = 与原来 `next(...)` 完全同一个对象（按 `units` 插入顺序）。
+        representative = {}
+        for t in g.units.values():
+            if t.alive() and t.color != self.side and t.pos in hexes:
+                representative.setdefault(t.pos, t.id)
         for hx in sorted(hexes):
             shooters = []
+            probe = representative.get(hx)
             for u in own_alive:
                 d = G.distance(u.pos, hx)
                 if any((WEAPONS.get(w) or (None, None, 0))[2] >= d for w in u.wz):
-                    if g.can_observe(u.id, next((t.id for t in g.units.values()
-                                                 if t.alive() and t.pos == hx and t.color != self.side), u.id)):
+                    if probe is None or g.can_observe(u.id, probe):
                         shooters.append(u.id)
             if shooters:
                 acts.append({"type": "area_fire", "unit": shooters[0],
