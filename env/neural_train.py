@@ -134,7 +134,8 @@ class NeuralTrainer:
     def __init__(self, snapshot, *, seed=0, train_seed_start=0, batch_episodes=4,
                  episode_config=None, policy_config=None, heldout_seeds=(1000000, 1000001),
                  observation_schema=1, allow_real=False, scoring_mode="verified",
-                 interface="serial", rollout_workers=1, policy_seed_mode=None):
+                 interface="serial", rollout_workers=1, policy_seed_mode=None,
+                 progress_path=None):
         for name, value in (("seed", seed), ("train_seed_start", train_seed_start)):
             _positive_int(name, value, True)
         _positive_int("batch_episodes", batch_episodes)
@@ -150,6 +151,9 @@ class NeuralTrainer:
             raise ValueError("rollout_workers>1 requires policy_seed_mode='per_episode'")
         self.rollout_workers = rollout_workers
         self.policy_seed_mode = policy_seed_mode
+        # ★ 进度台账（可选）：每完成一局追加一行 JSON，供 `tools/monitor_train.py` 跟读。
+        #   开不开都不影响学习结果（只写文件），也不进检查点。
+        self.progress_path = None if progress_path is None else str(progress_path)
         if scoring_mode not in ("verified", "platform"):
             raise ValueError("scoring_mode must be 'verified' or 'platform'")
         if interface not in INTERFACES:
@@ -359,7 +363,27 @@ class NeuralTrainer:
                     raise
                 self.pending.clear()
                 self.updates += 1
+        self._write_progress(record)
         return record
+
+    def _write_progress(self, record):
+        """追加一行进度（失败不影响训练：进度是外挂观测，不是产物）。"""
+        if not self.progress_path:
+            return
+        row = {"wall": time.time(), "attempted": self.episodes_attempted,
+               "completed": self.episodes_completed, "updates": self.updates,
+               "seed": record.get("seed"), "side": record.get("learner_side"),
+               "own": record.get("own_score"), "R": record.get("learning_return"),
+               "diff": record.get("score_diff"), "result": record.get("result"),
+               "decisions": record.get("decisions"),
+               "episode_seconds": record.get("elapsed_seconds"),
+               "truncated": bool(record.get("own_score") is None)}
+        try:
+            Path(self.progress_path).parent.mkdir(parents=True, exist_ok=True)
+            with Path(self.progress_path).open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+        except OSError:
+            self.progress_path = None      # 写不了就关掉，不拖累训练
 
     def evaluate(self, seeds=None):
         seeds = self.heldout_seeds if seeds is None else list(seeds)
@@ -426,7 +450,8 @@ class NeuralTrainer:
             stream.write(canonical(self.checkpoint()) + "\n")
 
     @classmethod
-    def load(cls, path, snapshot, *, allow_real=False, interface=None, rollout_workers=None):
+    def load(cls, path, snapshot, *, allow_real=False, interface=None, rollout_workers=None,
+             progress_path=None):
         data = json.loads(Path(path).read_text("utf-8"))
         if data.get("schema_version") != 1 or data.get("algorithm") not in ("neural_terminal_reinforce_vs_random", "neural_terminal_ppo_clip_vs_random"):
             raise ValueError("unsupported checkpoint")
@@ -447,6 +472,7 @@ class NeuralTrainer:
                       rollout_workers=(data.get("rollout_workers", 1) if rollout_workers is None
                                        else rollout_workers),
                       policy_seed_mode=data.get("policy_seed_mode", "shared"),
+                      progress_path=progress_path,
                       **{k: data[k] for k in ("seed", "train_seed_start", "batch_episodes",
                                               "episode_config", "policy_config", "heldout_seeds")})
         if trainer.scoring_mode != data.get("scoring_mode", "verified"):
@@ -519,6 +545,8 @@ def main(argv=None):
     parser.add_argument("--policy-seed-mode", choices=POLICY_SEED_MODES, default=None,
                         help="采样随机流口径：shared=跨局沿用一条流（历史默认）；"
                              "per_episode=每局按 (seed, 局种子, 席位) 重新播种（并行必须）")
+    parser.add_argument("--progress", type=Path, default=None,
+                        help="可选的进度台账（JSONL，每局一行），供 tools/monitor_train.py 跟读")
     parser.add_argument("--buckets", type=int, default=2048)
     parser.add_argument("--hidden-dim", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=0.001)
@@ -592,12 +620,14 @@ def main(argv=None):
             episode_config["deep_validate"] = True
         trainer = NeuralTrainer.load(args.resume, args.snapshot,
                                     allow_real=args.allow_real_map,
-                                    rollout_workers=args.rollout_workers) if args.resume else NeuralTrainer(
+                                    rollout_workers=args.rollout_workers,
+                                    progress_path=args.progress) if args.resume else NeuralTrainer(
             args.snapshot, observation_schema=args.observation_schema or 1, seed=args.seed, train_seed_start=args.train_seed_start, batch_episodes=args.batch_episodes,
             heldout_seeds=args.eval_seeds, episode_config=episode_config,
             allow_real=args.allow_real_map, scoring_mode=args.scoring_mode,
             interface=args.interface or "serial",
             rollout_workers=(args.rollout_workers or 1), policy_seed_mode=args.policy_seed_mode,
+            progress_path=args.progress,
             policy_config={"buckets": args.buckets, "hidden_dim": args.hidden_dim, "learning_rate": args.learning_rate,
                            **({"baseline_offset": args.baseline_offset} if args.baseline_offset is not None else {}),
                            **{k: getattr(args, k) for k in ("update_mode", "ppo_clip", "update_epochs") if getattr(args, k) is not None}})

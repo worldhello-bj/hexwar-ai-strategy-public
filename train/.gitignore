@@ -18,4 +18,7 @@ requirements.txt
 analysis/
 snapshot
 __pycache__/
+
+# 一次性长跑的临时配置（由脚本生成，只在本地用；正式配置不要用 `_` 开头）
+configs/_*.json
 .pytest_cache/
