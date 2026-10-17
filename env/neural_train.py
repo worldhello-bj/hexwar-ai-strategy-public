@@ -1,8 +1,13 @@
-"""Generic terminal-return neural learning in an offline synthetic game.
+"""终端回报的神经学习，按**真实比赛口径**训练。
 
-One shared learner alternates seats against a frozen uniform legal-action
-sampler. Only own-seat observations enter the learner. Rewards are the original
-terminal own total, undiscounted, with no shaping or coordinate transformations.
+口径只有一种（被证伪的旧做法已删，不再保留可选分支）：
+
+* **对手 = 当前策略自己**（自博弈）。均匀随机对手一旦被超越就不再提供梯度。
+* **奖励 = 净胜分增量** = (本方终−本方开) − (对方终−对方开)：敌方夺控会扣分。
+* **采样流 = 每局独立播种**：局与局无关 ⇒ 可并行、可复现。
+* **训练 = 成对**：同一种子一蓝一红，回报取两局净分之和（= 平台判胜负的总分差）。
+
+Only own-seat observations enter the learner.
 """
 import argparse
 import concurrent.futures
@@ -59,49 +64,43 @@ def summary(records):
             **{label: sum(r["result"] == label for r in completed) for label in ("win", "draw", "loss")}}
 
 
-#: 采样随机流的口径：
-#:
-#: * `shared`（历史默认）= **同一条** `policy.rng` 跨局沿用 ⇒ 第 k 局的随机数取决于前面
-#:   跑过多少局，**不能并行**（并行后每局拿到的流位置就变了）。
-#: * `per_episode` = 每局按 `derived_seed(seed, episode_seed, seat, "policy_sample")`
-#:   重新播种 ⇒ **局与局相互独立**，顺序无关，所以可以丢进进程池并行，而且结果可复现。
-POLICY_SEED_MODES = ("shared", "per_episode")
+#: 采样随机流：**每局按 `derived_seed(seed, 局种子, 席位, "policy_sample")` 重新播种**。
+#: 以前还提供过“跨局沿用同一条 `policy.rng`”的口径，它使第 k 局的随机数取决于
+#: 前面跑过多少局 ⇒ 不能并行、顺序一变结果就变。已删除。
 
-#: 学习目标（奖励）的口径：
+#: 学习目标（奖励）：**净胜分增量** = (本方终−本方开) − (对方终−对方开)。
+#: 与平台判胜负的“净胜分”同向，并且开局席位常数被两边各扣一次后**完全抵消**。
+#: 只需接口能给出双方开局分（`opening_scores`，1 Hz 实时接口有）；
+#: 拿不到时退回“本方得分增量” —— 那是接口能力限制，不是可选口径。
 #:
-#: * `own_gain`（旧口径）= 终局本方分 − 本方开局分。**重大缺陷**：本方分里没有任何
-#:   “敌方夺控”的项，所以对手拿下夺控点、拉开分差时这个奖励**毫无反应**
-#:   ⇒ 策略学不到“别丢点”。
-#: * `net_gain`（新默认）= (终局本方分 − 本方开局分) − (终局对方分 − 对方开局分)
-#:   = 终局净胜分 − 开局净胜分。它与平台判定胜负的“净胜分”同向，
-#:   而且开局席位常数被两边各扣一次后**完全抵消**。
-#:   需要该接口能给出双方开局分（`opening_scores`，1 Hz 实时接口有；回合制没有则退回 `own_gain`）。
-REWARD_MODES = ("net_gain", "own_gain")
+#: 已经被删掉的旧口径 `own_gain`（只扣本方开局分）：本方分里没有任何“敌方夺控”项，
+#: 对手拿下夺控点、拉开分差时奖励**毫无反应** ⇒ 策略学不到“别丢点”。
+
+#: 对手：**用当前策略自己给对手选招**（自博弈）。
+#: 已经被删掉的旧做法是均匀随机抽合法动作 —— 它太弱且不自洽：练到一定程度后
+#: 继续与它对练几乎不再提供梯度，策略很快撞到天花板。
 
 #: 进程池 worker 的公共上下文（每个进程只需初始化一次 snapshot/配置）
 _WORKER_STATE = {}
 
 
-def policy_sample_seed(mode, seed, episode_seed, learner_side):
-    """按采样口径派生该局的策略采样种子（`shared` 口径返回 None ⇒ 不重播种）。"""
-    if mode != "per_episode":
-        return None
+def policy_sample_seed(seed, episode_seed, learner_side):
+    """每局按 (seed, 局种子, 席位) 派生采样种子 ⇒ 局与局相互独立、可并行、可复现。"""
     return derived_seed(seed, episode_seed, learner_side, "policy_sample")
 
 
 class _RolloutRunner:
     """跑一局所需的**全部不可变上下文**（可 pickle ⇒ 能丢进进程池）。
 
-    `NeuralTrainer._rollout` 现在只是它的委托，所以串行路径的行为**一字未改**；
-    并行路径把同一个对象交给子进程，子进程用同一段代码算。
+    `NeuralTrainer._rollout` 现在只 是它的委托；并行路径把同一个对象交给子进程，
+    子进程用同一段代码算 —— 所以串行与并行逐字节相同。
     """
 
     __slots__ = ("snapshot", "manifest", "interface", "episode_config", "observation_schema",
-                 "seed", "entropy_every", "allow_real", "policy_seed_mode", "reward_mode")
+                 "seed", "entropy_every", "allow_real")
 
     def __init__(self, snapshot, manifest, interface, episode_config, observation_schema,
-                 seed, entropy_every, allow_real, policy_seed_mode="shared",
-                 reward_mode="net_gain"):
+                 seed, entropy_every, allow_real):
         self.snapshot = snapshot
         self.manifest = manifest
         self.interface = interface
@@ -110,12 +109,10 @@ class _RolloutRunner:
         self.seed = seed
         self.entropy_every = entropy_every
         self.allow_real = allow_real
-        self.policy_seed_mode = policy_seed_mode
-        self.reward_mode = reward_mode
 
     def sample_seed(self, episode_seed, learner_side):
-        """`per_episode` 口径下该局的采样种子（`shared` 口径返回 None）。"""
-        return policy_sample_seed(self.policy_seed_mode, self.seed, episode_seed, learner_side)
+        """该局的采样种子（每局独立）。"""
+        return policy_sample_seed(self.seed, episode_seed, learner_side)
 
     def rollout(self, policy, episode_seed, learner_side, *, training):
         # 复用 `NeuralTrainer._rollout` 的**同一份实现**：它只依赖上面这 8 个不可变
@@ -147,26 +144,15 @@ class NeuralTrainer:
     def __init__(self, snapshot, *, seed=0, train_seed_start=0, batch_episodes=4,
                  episode_config=None, policy_config=None, heldout_seeds=(1000000, 1000001),
                  observation_schema=1, allow_real=False, scoring_mode="verified",
-                 interface="serial", rollout_workers=1, policy_seed_mode=None,
-                 progress_path=None, reward_mode="net_gain", trajectory_stride=1):
+                 interface="serial", rollout_workers=1,
+                 progress_path=None, trajectory_stride=1):
         for name, value in (("seed", seed), ("train_seed_start", train_seed_start)):
             _positive_int(name, value, True)
         _positive_int("batch_episodes", batch_episodes)
         _positive_int("rollout_workers", rollout_workers)
         if rollout_workers > 64:
             raise ValueError("rollout_workers exceeds per-call safety bound")
-        if policy_seed_mode is None:
-            # 并行时必须局间独立，否则同一局的结果取决于并行度 ⇒ 自动选 per_episode。
-            policy_seed_mode = "shared" if rollout_workers <= 1 else "per_episode"
-        if policy_seed_mode not in POLICY_SEED_MODES:
-            raise ValueError("policy_seed_mode must be one of %s" % (POLICY_SEED_MODES,))
-        if rollout_workers > 1 and policy_seed_mode != "per_episode":
-            raise ValueError("rollout_workers>1 requires policy_seed_mode='per_episode'")
         self.rollout_workers = rollout_workers
-        self.policy_seed_mode = policy_seed_mode
-        if reward_mode not in REWARD_MODES:
-            raise ValueError("reward_mode must be one of %s" % (REWARD_MODES,))
-        self.reward_mode = reward_mode
         # ★ 轨迹子采样：进梯度的决策只取每 k 条中的 1 条。终极奖励是**单局一个标量**，
         #   同一局里所有决策共享它，所以抽样不会丢“局级信号”，却把
         #   update 成本与检查点体积都降到 1/k（一局轨迹原本 ≈200 MB 的 JSON）。
@@ -174,6 +160,15 @@ class NeuralTrainer:
         if trajectory_stride > 64:
             raise ValueError("trajectory_stride exceeds safety bound")
         self.trajectory_stride = trajectory_stride
+        # ★ 成对训练**恒开**（真实比赛就是「红一局 + 蓝一局算总分」）：
+        #   ①第 i 局用种子 `train_seed_start + i//2`、席位交替（同种子、两边各打一局）；
+        #   ②**回报用这一对的和**，而不是单局：
+        #        R = net(蓝局) + net(红局) = (S蓝+S红) − (O蓝+O红)
+        #      开局席位常数（234/354）成对后**恰好完全抵消**，结果就是平台判胜负的总分差。
+        #   两局的动作都按同一配对回报记账（比赛胜负由总分决定 ⇒ 归因应是配对级）。
+        if batch_episodes % 2:
+            raise ValueError("batch_episodes must be even (训练恒为成对)")
+        self._pair_buffer = {}
         # ★ 进度台账（可选）：每完成一局追加一行 JSON，供 `tools/monitor_train.py` 跟读。
         #   开不开都不影响学习结果（只写文件），也不进检查点。
         self.progress_path = None if progress_path is None else str(progress_path)
@@ -239,15 +234,12 @@ class NeuralTrainer:
         opening_own = opening.get(learner_side)
         other_side = SIDES[1 - SIDES.index(learner_side)]
         opening_other = opening.get(other_side)
-        opponent_rng = random.Random(derived_seed(self.seed, episode_seed, learner_side, "opponent"))
+        # 双方都由策略选招：各自派生一条**局部**采样流，互不影响（从不碰 `policy.rng`）。
+        sample_rng = np.random.default_rng(
+            policy_sample_seed(self.seed, episode_seed, learner_side))
+        opponent_rng = np.random.default_rng(
+            derived_seed(self.seed, episode_seed, learner_side, "opponent_sample"))
         eval_rng = np.random.default_rng(derived_seed(self.seed, episode_seed, learner_side, "evaluation"))
-        # ★ 采样流口径（`POLICY_SEED_MODES`）：`per_episode` 下每局用一条**局部**流，
-        #   使局与局相互独立 ⇒ 顺序无关、可并行、可复现；策略自身的 `rng` **不动**，
-        #   这样并行与串行的检查点（含 rng 状态）才能逐字节相同。
-        sample_seed = policy_sample_seed(getattr(self, "policy_seed_mode", "shared"),
-                                         self.seed, episode_seed, learner_side)
-        sample_rng = (np.random.default_rng(sample_seed)
-                      if sample_seed is not None else None)
         trajectory, entropies, counts = [], [], []
         decisions = 0
         while not status["terminated"] and not status["truncated"]:
@@ -271,20 +263,25 @@ class NeuralTrainer:
                     if decisions % self.entropy_every == 1:
                         probs = policy.probabilities(observation, candidates)
                         entropies.append(float(-np.sum(probs * np.log(np.maximum(probs, 1e-300)))))
-                    # 只有 per_episode 口径才传 `rng`：默认（shared）调用形态与历史
-                    # 完全一致（外部测试会用两个参数的桩替换 `policy.sample`）。
-                    action, decision = (policy.sample(observation, candidates)
-                                        if sample_rng is None else
-                                        policy.sample(observation, candidates, rng=sample_rng))
+                    # 每局一条局部流 ⇒ 局与局无关、可并行、可复现。
+                    action, decision = policy.sample(observation, candidates, rng=sample_rng)
                     trajectory.append(decision)
                 else:
                     probs = policy.probabilities(observation, candidates)
                     entropies.append(float(-np.sum(probs * np.log(np.maximum(probs, 1e-300)))))
                     action = candidates[int(eval_rng.choice(len(candidates), p=probs))]
             else:
-                # No opposing observation is ever fetched or supplied to learner.
-                action = opponent_rng.choice(candidates)
-            if side == learner_side and self.observation_schema == 2:
+                # 对手也由**当前策略**选招（自博弈）。对手的观测只用于给对手选招，
+                # **绝不**传给学习者、也不进轨迹。
+                if self.observation_schema == 2:
+                    action = policy.sample(public_episode.observe(side),
+                                           public_episode.candidate_views(side),
+                                           rng=opponent_rng)[0]
+                else:
+                    action = policy.sample(episode.observe(side), candidates,
+                                           rng=opponent_rng)[0]
+            if self.observation_schema == 2:
+                # schema-2 的候选是 `{"action", "public_context"}` 包，step 只收内层的 action
                 action = action["action"]
             status = episode.step(action, side=side)
             # 回合制接口的奖励合约是"只在终局给分"；实时接口的 `status` 不带 rewards
@@ -302,21 +299,17 @@ class NeuralTrainer:
             other_score = scores[other_side]
             diff = own_score - other_score
             result = "win" if diff > 0 else "loss" if diff < 0 else "draw"
-        # 学习目标（见 `REWARD_MODES`）：
-        #   `net_gain` = 净胜分增量 = (own终−own开) − (opp终−opp开)：
-        #      与平台判胜负的“净胜分”同向，且开局席位常数被两边各扣一次后抵消；
-        #      **敌方夺控会扣分** ⇒ 策略才学得到“别丢点”。
-        #   `own_gain` = 旧口径，只扣本方开局分（保留作对照）。
+        # 学习目标：**净胜分增量**（见文件头）。拿不到开局分（回合制接口）时退回
+        # “本方得分增量” —— 那是接口能力限制，不是可选口径。
         learning_return = own_score
         own_gain = net_gain = None
         if own_score is not None and opening_own is not None:
             own_gain = own_score - opening_own
             if other_score is not None and opening_other is not None:
                 net_gain = own_gain - (other_score - opening_other)
-            learning_return = (net_gain if self.reward_mode == "net_gain" and net_gain is not None
-                               else own_gain)
+            learning_return = net_gain if net_gain is not None else own_gain
         record = {"seed": episode_seed, "learner_side": learner_side, "status": status,
-                  "interface": self.interface, "reward_mode": self.reward_mode,
+                  "interface": self.interface,
                   "own_score": own_score, "other_score": other_score,
                   "opening_own": opening_own, "opening_other": opening_other,
                   "own_gain": own_gain, "net_gain": net_gain,
@@ -353,28 +346,32 @@ class NeuralTrainer:
             # too, so a failed batch can be retried or checkpointed exactly.
             ppo_rng = (copy.deepcopy(self.policy.rng.bit_generator.state)
                        if self.policy.config.get("update_mode") == "ppo_clip" else None)
-            record, trajectory = self._rollout(self.policy, self.train_seed_start + index,
-                                               SIDES[index % 2], training=True)
+            seed, side = self._slot(index)
+            record, trajectory = self._rollout(self.policy, seed, side, training=True)
             records.append(self._absorb(record, trajectory, ppo_rng))
+        # 不在此处 flush 半对：它要等下一次调用的对面那一局，
+        # 否则“拆成两次 train()”与“一次跑完”的优化序列就不一致。
         return records
+
+    def _slot(self, index):
+        """第 `index` 局的 (种子, 席位)：同一种子打两局（先蓝后红）。"""
+        return self.train_seed_start + index // 2, SIDES[index % 2]
 
     def _runner_context(self):
         return _RolloutRunner(self.snapshot, self.manifest, self.interface,
                               self.episode_config, self.observation_schema, self.seed,
-                              self.entropy_every, self.allow_real, self.policy_seed_mode,
-                              self.reward_mode)
+                              self.entropy_every, self.allow_real)
 
     def _train_group(self, pool, size):
         """并行跑 `size` 局（同批、策略冻结），按串行顺序做账。"""
         base = self.episodes_attempted
-        seeds = [self.train_seed_start + base + i for i in range(size)]
-        sides = [SIDES[(base + i) % 2] for i in range(size)]
+        slots = [self._slot(base + i) for i in range(size)]
         ppo_rng = (copy.deepcopy(self.policy.rng.bit_generator.state)
                    if self.policy.config.get("update_mode") == "ppo_clip" else None)
         state = self.policy.checkpoint()
         results = list(pool.map(_worker_rollout,
                                 [(state, seed, side, True)
-                                 for seed, side in zip(seeds, sides)]))
+                                 for seed, side in slots]))
         return [self._absorb(record, trajectory, ppo_rng)
                 for record, trajectory in results]
 
@@ -383,26 +380,61 @@ class NeuralTrainer:
         self.episodes_attempted += 1
         if record["own_score"] is not None:
             self.episodes_completed += 1
-            # 学习目标：新记录里叫 `learning_return`（实时接口下=终局分−开局分）；
-            # 老记录/测试桩里没有这个键时退回终局本方分（历史口径）。
-            target = record.get("learning_return")
             stride = self.trajectory_stride
             kept = trajectory if stride == 1 else trajectory[::stride]
+            self._enqueue_pair(record, kept, ppo_rng)
+        self._write_progress(record)
+        return record
+
+    def _enqueue_pair(self, record, kept, ppo_rng):
+        """成对训练：同一 `seed` 的蓝/红两局到齐后，用**两局净分之和**一起入批。"""
+        record["pair_return"] = None
+        seed, side = record.get("seed"), record.get("learner_side")
+        if seed is None or side not in ("BLUE", "RED"):
+            # 测试桩/老记录可能没有这两个字段 ⇒ 当成单局处理，不静默拼错对
+            self._enqueue([(record, kept, record.get("learning_return"))], ppo_rng)
+            return
+        slot = self._pair_buffer.setdefault(seed, {})
+        slot[side] = (record, kept)
+        if len(slot) < 2:
+            return
+        self._pair_buffer.pop(seed, None)
+        blue, red = slot["BLUE"], slot["RED"]
+        gains = (blue[0].get("net_gain"), red[0].get("net_gain"))
+        if all(g is not None for g in gains):
+            pair_return = float(sum(gains))
+            blue[0]["pair_return"] = red[0]["pair_return"] = pair_return
+            entries = [(blue[0], blue[1], pair_return), (red[0], red[1], pair_return)]
+        else:
+            # 拿不到净分（如回合制接口没有开局分）⇒ 退回各自的单局目标
+            entries = [(blue[0], blue[1], blue[0].get("learning_return")),
+                       (red[0], red[1], red[0].get("learning_return"))]
+        try:
+            self._enqueue(entries, ppo_rng)
+        except BaseException:
+            # 入批失败（如更新报错）⇒ 整对放回缓冲，重试时才不会丢这两局。
+            self._pair_buffer[seed] = slot
+            raise
+
+    def _enqueue(self, entries, ppo_rng):
+        """把（可能成组的）若干条推进 `pending`；满批时更新；失败则整组回滚。"""
+        start = len(self.pending)
+        attempted_before = self.episodes_attempted - len(entries)
+        completed_before = self.episodes_completed - len(entries)
+        for record, kept, target in entries:
             self.pending.append((kept, record["own_score"] if target is None else target))
             if len(self.pending) == self.batch_episodes:
                 try:
                     record["update"] = self.policy.update_batch(self.pending)
                 except (FloatingPointError, OverflowError, ValueError):
+                    del self.pending[start:]
+                    self.episodes_attempted = attempted_before
+                    self.episodes_completed = completed_before
                     if ppo_rng is not None:
-                        self.pending.pop()
-                        self.episodes_attempted -= 1
-                        self.episodes_completed -= 1
                         self.policy.rng.bit_generator.state = ppo_rng
                     raise
                 self.pending.clear()
                 self.updates += 1
-        self._write_progress(record)
-        return record
 
     def _write_progress(self, record):
         """追加一行进度（失败不影响训练：进度是外挂观测，不是产物）。"""
@@ -413,7 +445,6 @@ class NeuralTrainer:
                "seed": record.get("seed"), "side": record.get("learner_side"),
                "own": record.get("own_score"), "R": record.get("learning_return"),
                "own_gain": record.get("own_gain"), "net_gain": record.get("net_gain"),
-               "reward_mode": record.get("reward_mode"),
                "diff": record.get("score_diff"), "result": record.get("result"),
                "decisions": record.get("decisions"),
                "episode_seconds": record.get("elapsed_seconds"),
@@ -476,14 +507,20 @@ class NeuralTrainer:
             "interface": self.interface,
             "entropy_every": self.entropy_every,
             "rollout_workers": self.rollout_workers,
-            "policy_seed_mode": self.policy_seed_mode,
-            "reward_mode": self.reward_mode,
             "trajectory_stride": self.trajectory_stride,
             "snapshot": self.manifest, "seed": self.seed, "train_seed_start": self.train_seed_start,
             "batch_episodes": self.batch_episodes, "episode_config": self.episode_config,
             "policy_config": self.policy_config, "heldout_seeds": self.heldout_seeds,
             "episodes_attempted": self.episodes_attempted, "episodes_completed": self.episodes_completed,
             "updates": self.updates, "policy": self.policy.checkpoint(), "initial_policy": self.initial_policy,
+            # ★ 半对缓冲也必须入盘：续跑时要拿它跟下一局拼对，否则这对的回报就变了。
+            "pair_buffer": [{"seed": record["seed"], "side": side,
+                             "return": record.get("learning_return"),
+                             "net_gain": record.get("net_gain"),
+                             "pair_return": record.get("pair_return"),
+                             "decisions": [d.to_dict() for d in kept]}
+                            for seed in sorted(self._pair_buffer, key=str)
+                            for side, (record, kept) in sorted(self._pair_buffer[seed].items())],
             "pending": [{"decisions": [d.to_dict() for d in trajectory], "return": score}
                         for trajectory, score in self.pending]})
 
@@ -509,13 +546,10 @@ class NeuralTrainer:
         trainer = cls(snapshot, observation_schema=data.get("observation_schema", 1), allow_real=allow_real,
                       scoring_mode=data.get("scoring_mode", "verified"),
                       interface=saved_interface,
-                      # 并行度只是速度旋钮，允许续跑时覆盖；采样口径**不允许**变
-                      # （改了就不是同一条随机实现，训练会失去可比性）。
+                      # 并行度只是速度旋钮，允许续跑时覆盖。
                       rollout_workers=(data.get("rollout_workers", 1) if rollout_workers is None
                                        else rollout_workers),
-                      policy_seed_mode=data.get("policy_seed_mode", "shared"),
-                      reward_mode=data.get("reward_mode", "own_gain"),
-                      trajectory_stride=data.get("trajectory_stride", 1),
+                      trajectory_stride=data["trajectory_stride"],
                       progress_path=progress_path,
                       **{k: data[k] for k in ("seed", "train_seed_start", "batch_episodes",
                                               "episode_config", "policy_config", "heldout_seeds")})
@@ -544,7 +578,18 @@ class NeuralTrainer:
                 raise ValueError("return baseline count differs from completed batches")
         trainer.initial_policy = copy.deepcopy(data["initial_policy"])
         trainer.pending = [([Decision.from_dict(d) for d in row["decisions"]], row["return"]) for row in data["pending"]]
-        if len(trainer.pending) >= trainer.batch_episodes or trainer.episodes_completed != trainer.updates * trainer.batch_episodes + len(trainer.pending):
+        trainer._pair_buffer = {}
+        for row in data["pair_buffer"]:
+            trainer._pair_buffer.setdefault(row["seed"], {})[row["side"]] = (
+                {"seed": row["seed"], "learner_side": row["side"],
+                 "learning_return": row["return"], "net_gain": row["net_gain"],
+                 "pair_return": row["pair_return"]},
+                [Decision.from_dict(d) for d in row["decisions"]])
+        # 已完成的局 = 已入批更新掉的 + 还在 pending 的 + 还在等对面那一局的半对
+        buffered = sum(len(sides) for sides in trainer._pair_buffer.values())
+        if len(trainer.pending) >= trainer.batch_episodes or (
+                trainer.episodes_completed
+                != trainer.updates * trainer.batch_episodes + len(trainer.pending) + buffered):
             raise ValueError("invalid batch counters")
         buckets = trainer.policy.feature_width
         if any((features[0] >= buckets).any() for history, _ in trainer.pending for decision in history
@@ -583,17 +628,11 @@ def main(argv=None):
                              "realtime=1 Hz（每秒双方各一次决策、机动按秒并行推进，与平台同粒度）。"
                              "不传时用检查点里记的那个（新训练默认 serial）。")
     parser.add_argument("--rollout-workers", type=int, default=None,
-                        help="并行 rollout 的进程数（默认 1 = 串行历史口径；续跑时默认沿用检查点里的值）。"
-                             ">1 时自动改用 policy_seed_mode=per_episode：每局独立播种 ⇒ "
-                             "局与局无关、可并行、结果可复现；并行度不会超过 batch_episodes。")
-    parser.add_argument("--policy-seed-mode", choices=POLICY_SEED_MODES, default=None,
-                        help="采样随机流口径：shared=跨局沿用一条流（历史默认）；"
-                             "per_episode=每局按 (seed, 局种子, 席位) 重新播种（并行必须）")
+                        help="并行 rollout 的进程数（默认 1 = 串行；续跑时默认沿用检查点里的值）。"
+                             "每局独立播种 ⇒ 局与局无关、可并行、结果可复现；"
+                             "并行度不会超过 batch_episodes。")
     parser.add_argument("--progress", type=Path, default=None,
                         help="可选的进度台账（JSONL，每局一行），供 tools/monitor_train.py 跟读")
-    parser.add_argument("--reward-mode", choices=REWARD_MODES, default="net_gain",
-                        help="学习目标：net_gain（默认，净胜分增量 = 两边各扣开局分后相减，"
-                             "敌方夺控会扣分）/ own_gain（旧口径，只扣本方开局分）")
     parser.add_argument("--trajectory-stride", type=int, default=1,
                         help="进梯度的决策子采样步长（默认 1=全部）。单局奖励是一个标量，"
                              "抽稀不丢局级信号；k>1 时 update 成本与检查点体积降为 1/k")
@@ -637,7 +676,6 @@ def main(argv=None):
                       "observation_schema": trainer.observation_schema,
                       "interface": trainer.interface,
                       "rollout_workers": trainer.rollout_workers,
-                      "policy_seed_mode": trainer.policy_seed_mode,
                       "scoring_mode": trainer.scoring_mode,
                       "scoring_version": scoring.SCORING_VERSION,
                       "episode_config": trainer.episode_config,
@@ -676,8 +714,8 @@ def main(argv=None):
             heldout_seeds=args.eval_seeds, episode_config=episode_config,
             allow_real=args.allow_real_map, scoring_mode=args.scoring_mode,
             interface=args.interface or "serial",
-            rollout_workers=(args.rollout_workers or 1), policy_seed_mode=args.policy_seed_mode,
-            reward_mode=args.reward_mode, trajectory_stride=args.trajectory_stride,
+            rollout_workers=(args.rollout_workers or 1),
+            trajectory_stride=args.trajectory_stride,
             progress_path=args.progress,
             policy_config={"buckets": args.buckets, "hidden_dim": args.hidden_dim, "learning_rate": args.learning_rate,
                            **({"baseline_offset": args.baseline_offset} if args.baseline_offset is not None else {}),
@@ -688,11 +726,6 @@ def main(argv=None):
             raise ValueError("requested scoring mode differs from resumed checkpoint")
         if args.interface is not None and args.interface != trainer.interface:
             raise ValueError("requested interface differs from resumed checkpoint")
-        if (args.policy_seed_mode is not None
-                and args.policy_seed_mode != trainer.policy_seed_mode):
-            raise ValueError("requested policy seed mode differs from resumed checkpoint")
-        if args.reward_mode != trainer.reward_mode:
-            raise ValueError("requested reward mode differs from resumed checkpoint")
         if args.trajectory_stride != trainer.trajectory_stride:
             raise ValueError("requested trajectory stride differs from resumed checkpoint")
         if (args.baseline_offset is not None and
@@ -717,7 +750,6 @@ def main(argv=None):
                   "observation_schema": trainer.observation_schema,
                   "interface": trainer.interface,
                   "rollout_workers": trainer.rollout_workers,
-                  "policy_seed_mode": trainer.policy_seed_mode,
                   "scoring_mode": trainer.scoring_mode,
                   "scoring_version": scoring.SCORING_VERSION,
                   "episode_config": trainer.episode_config, "policy_config": trainer.policy_config,

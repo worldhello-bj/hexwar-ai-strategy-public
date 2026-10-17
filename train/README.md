@@ -12,10 +12,10 @@
 所以训练流程被设计成：
 
 ```
-py -3.13 run_train.py train --algo ppo --config configs/ppo_realmap.json
+py -3.13 run_train.py train --algo ppo --config configs/ppo_match.json
         └─ ① 先过规则门（自检 + 4 份规则校验 + 计分对账）
            └─ ② 过了才开训（规则不对就别训——否则学的是错规则）
-              └─ ③ 训练完用 eval 在同一批种子上对比初始策略与训练后策略
+              └─ ③ 训练完用同一种子对比初始策略与训练后策略
 ```
 
 ## 快速开始
@@ -23,20 +23,29 @@ py -3.13 run_train.py train --algo ppo --config configs/ppo_realmap.json
 ```bash
 cd train
 
-py -3.13 run_train.py rules                      # 规则门（30/30 + 30/30 + 20/20 + 31/31 + 计分对账）
+py -3.13 run_train.py rules                       # 规则门（30/30 + 30/30 + 37/37 + 31/31 + 计分对账）
 py -3.13 run_train.py selftest                    # 引擎自检
-py -3.13 run_train.py mc --config configs/smoke_realmap.json    # 3 局冒烟（就是比赛初设）
-py -3.13 run_train.py mc  --config configs/mc_realmap.json      # 60 局自博弈基线
-py -3.13 run_train.py ppo --config configs/ppo_realmap.json     # 160 局 PPO
-py -3.13 run_train.py eval --config configs/eval_realmap.json \
-        --checkpoint analysis/realmap/ppo160.json               # 同种子对照评测
 py -3.13 run_train.py check                       # train/ 与核心是否同步（防漂移）
+
+# 短跑：直接跑一份配置（适合调试）
+py -3.13 run_train.py train --algo ppo --config configs/ppo_match.json --episodes 8
+
+# 长跑：分段 + 每段落检查点 + 失败重试（推荐）
+py -3.13 run_long.py --config configs/ppo_match.json --segments 6 --episodes 50
+
+# 跟读进度（另一个终端）
+py -3.13 ../tools/monitor_train.py --progress analysis/long/progress.jsonl --total 300 --follow
 ```
 
 `--dry-run` 只打印将要执行的命令行；`--live` 让规则门额外跑线上样本对账
 （需要封存区 `../archive/exploration/` 里的样本，没有会自动跳过）。
 
-★ **公开克隆里的用法一样**（`cd train` 后同样三条命令）。差别只是：公开仓不含生成副本，
+★ **`configs/` 只保留一份当前配置** `ppo_match.json`（真实比赛口径：1 Hz 实时对局、
+成对训练（同种子一蓝一红、回报=两局净分之和）、净胜分增量奖励、轨迹子采样）。
+历史上那批 `ppo_realmap / mc_realmap / smoke_realmap / eval_realmap / ppo_realtime / ppo_rsi2`
+已清理，需要时从 git 历史取回：`git log --oneline -- train/configs`。
+
+★ **公开克隆里的用法一样**（`cd train` 后同样命令）。差别只是：公开仓不含生成副本，
 入口会**自动改用仓库根的核心**（见下）。
 
 ## 目录
@@ -44,7 +53,8 @@ py -3.13 run_train.py check                       # train/ 与核心是否同步
 | 路径 | 说明 | 是否入库 |
 |---|---|---|
 | `run_train.py` | **统一入口**（规则门 / 训练 / 评测 / 自检 / 漂移检查） | ✅ 手工维护 |
-| `configs/*.json` | 训练配置（冒烟 / MC / PPO / 评测），全部指向比赛初设 | ✅ 手工维护 |
+| `run_long.py` | **长跑驱动**：切段、每段落检查点/报告、失败重试；段配置生成在临时目录 | ✅ 手工维护 |
+| `configs/ppo_match.json` | **唯一训练配置**（比赛口径） | ✅ 手工维护 |
 | `skill/hexwar-training/` | **给 AI 用的 skill**：怎么在这个环境里训练与评测 | ✅ 手工维护 |
 | `engine/` `env/` `offline/` `tests/` `tools/` `docs/` | 与核心仓库同步的**自包含副本**（公开仓里没有 ⇒ 自动改用仓库根） | ⛔ 生成（见 `MANIFEST.json`） |
 | `scenario/7527/` | **比赛初设**（想定 7527 地图与编成）的副本 —— 真源在仓库根 `../scenario/7527/` | ⛔ 生成 |

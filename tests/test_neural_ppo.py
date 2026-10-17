@@ -178,21 +178,24 @@ class ClippedPolicyTests(unittest.TestCase):
                 seen.append((seed, copy.deepcopy(policy.checkpoint()["params"]), policy.steps))
                 score = None if seed in (2, 5) else seed * 10
                 _, decision = policy.sample({"s": seed}, [1, 2])
-                return {"own_score": score}, [] if seed == 0 else [decision]
+                return {"own_score": score}, [decision]
             with patch.object(NeuralTrainer, "_rollout", rollout):
                 whole = trainer()
                 whole.train(8)
+                # 成对：同一对（种子）的两局之间不会有更新，配对完成后参数才变
                 self.assertEqual(seen[0][1], seen[1][1])
                 self.assertEqual(seen[2][1], seen[3][1])
-                self.assertEqual(seen[3][1], seen[4][1])
+                self.assertEqual(seen[4][1], seen[5][1])
+                self.assertNotEqual(seen[3][1], seen[4][1])
                 partial = trainer()
                 partial.train(4)
-                self.assertEqual(len(partial.pending), 1)
+                self.assertEqual(len(partial.pending), 0)
                 path = root / "saved.json"
                 partial.save(path)
                 resumed = NeuralTrainer.load(path, snapshot)
                 resumed.train(4)
                 self.assertEqual(resumed.checkpoint(), whole.checkpoint())
+                # 3 次配对更新，每次 3 个 epoch
                 self.assertEqual((resumed.updates, resumed.policy.steps, resumed.policy.return_count), (3, 9, 6))
             # A failed final rollout/update restores a resumable partial batch,
             # including its sampling RNG, rather than leaving a full pending list.
@@ -215,7 +218,8 @@ class ClippedPolicyTests(unittest.TestCase):
                 retry = NeuralTrainer.load(retry_path, snapshot)
                 retry.train(7)
                 self.assertEqual(retry.checkpoint(), whole.checkpoint())
-            for steps in (1, 4, 6):
+            # partial 已做 2 次更新（每次 3 epoch）⇒ 合法 steps 只有 0/3/6
+            for steps in (1, 4, 7):
                 data = partial.checkpoint()
                 data["policy"]["steps"] = steps
                 bad = root / "bad.json"

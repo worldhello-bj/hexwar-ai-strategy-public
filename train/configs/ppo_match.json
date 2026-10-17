@@ -1,0 +1,23 @@
+{
+ "note": "当前唯一的训练配置（真实比赛口径）。口径已写死在 env/neural_train.py：①对手 = 当前策略自己（自博弈）；②奖励 = 净胜分增量；③每局独立播种（可并行、可复现）；④成对训练（同种子一蓝一红，回报取两局净分之和 = 平台判胜负的总分差）。这里只留速度/规模旋钮。长跑用 run_long.py 分段。",
+ "snapshot": "../scenario/7527",
+ "allow_real_map": true,
+ "interface": "realtime",
+ "rollout_workers": 4,
+ "move_radius": 3,
+ "batch_episodes": 4,
+ "trajectory_stride": 4,
+ "max_seconds": 1200,
+ "update_mode": "ppo_clip",
+ "ppo_clip": 0.2,
+ "update_epochs": 2,
+ "buckets": 4096,
+ "hidden_dim": 64,
+ "learning_rate": 0.001,
+ "scoring": "verified",
+ "seed": 0,
+ "eval_seeds": [1000000, 1000001],
+ "progress": "analysis/long/progress.jsonl",
+ "checkpoint": "analysis/long/ckpt.json",
+ "report": "analysis/long/report.json"
+}

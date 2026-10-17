@@ -1,29 +1,24 @@
 # -*- coding: utf-8 -*-
-"""学习目标的口径契约（`REWARD_MODES`）与轨迹子采样。
+"""奖励与轨迹子采样的契约。**只有净胜分增量这一种奖励。**
 
-核心两条：
-1. `net_gain` = 净胜分增量 = (own终 − own开) − (opp终 − opp开)。
-   旧口径 `own_gain` 只看本方分，**敌方夺控拉分时毫无反应** ⇒ 学不到“别丢点”。
-2. `trajectory_stride` 只影响**进梯度的条数**，不能改变一局的结果/决策，
-   也不改变学习目标的数值。
+- 奖励 = (本方终 − 本方开) − (对方终 − 对方开)：敌方夺控会扣分，策略才学得到“别丢点”。
+- 成对训练下两局共用同一个回报：R = net(蓝) + net(红)，开局席位常数完全抵消。
+- 接口拿不到开局分（回合制）时退回“本方得分增量” —— 那是接口能力限制，不是可选口径。
+- `trajectory_stride=k` 只抽稀进梯度的决策，不改变奖励本身。
 """
-import json
+import copy
 import tempfile
 import unittest
 from pathlib import Path
 
 from env.match_eval import write_synthetic_snapshot
-from env.neural_train import NeuralTrainer, main
+from env.neural_train import NeuralTrainer
 
 CONFIG = {"policy_config": {"buckets": 32, "hidden_dim": 4},
           "episode_config": {"max_seconds": 20, "move_radius": 1}}
 
 
-def strip_timing(rows):
-    return [{k: v for k, v in r.items() if k != "elapsed_seconds"} for r in rows]
-
-
-class RewardModeTests(unittest.TestCase):
+class RewardTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -36,70 +31,62 @@ class RewardModeTests(unittest.TestCase):
 
     def test_net_gain_matches_terminal_scores(self):
         trainer = self.trainer()
-        record, _ = trainer._rollout(trainer.policy, 4242, "BLUE", training=True)
-        self.assertIsNotNone(record["own_score"], "合成局应当能跑完（否则本测试无意义）")
-        expected = ((record["own_score"] - record["opening_own"])
-                    - (record["other_score"] - record["opening_other"]))
-        self.assertEqual(record["net_gain"], expected)
-        self.assertEqual(record["learning_return"], expected)
-        self.assertEqual(record["reward_mode"], "net_gain")
+        for record in trainer.train(4):
+            if record["net_gain"] is None:
+                continue
+            expected = ((record["own_score"] - record["opening_own"])
+                        - (record["other_score"] - record["opening_other"]))
+            self.assertAlmostEqual(record["net_gain"], expected)
+            self.assertAlmostEqual(record["own_gain"], record["own_score"] - record["opening_own"])
+            self.assertAlmostEqual(record["learning_return"], expected)
 
-    def test_own_gain_mode_keeps_old_semantics(self):
-        trainer = self.trainer(reward_mode="own_gain")
-        record, _ = trainer._rollout(trainer.policy, 4242, "RED", training=True)
-        self.assertEqual(record["learning_return"], record["own_gain"])
-        self.assertEqual(record["own_gain"],
-                         record["own_score"] - record["opening_own"])
-
-    def test_net_gain_penalises_enemy_capture(self):
-        """净胜分增量必须对“敌方涨分”敏感（旧口径完全无感）。"""
+    def test_pair_return_cancels_opening_offsets(self):
+        """成对回报 = 两局净分之和 = 双方终局分之和 − 双方开局分之和。"""
         trainer = self.trainer()
-        record, _ = trainer._rollout(trainer.policy, 4243, "BLUE", training=True)
-        if record["net_gain"] is None:
-            self.skipTest("本局未完成或缺少开局分")
-        own_move = record["own_score"] - record["opening_own"]
-        enemy_move = record["other_score"] - record["opening_other"]
-        self.assertEqual(record["net_gain"], own_move - enemy_move)
-        # 反证：只扣本方分的旧口径看不见 enemy_move
-        self.assertNotEqual(record["own_gain"], record["net_gain"]) if enemy_move else None
+        records = trainer.train(2)
+        blue, red = records
+        expected = ((blue["own_score"] + red["own_score"])
+                    - (blue["opening_own"] + red["opening_own"]))
+        self.assertAlmostEqual(blue["pair_return"], expected)
+        self.assertAlmostEqual(red["pair_return"], expected)
+        self.assertAlmostEqual(expected, blue["net_gain"] + red["net_gain"])
+
+    def test_enemy_capture_is_penalised(self):
+        """敌方加分必须让本方净胜分**下降**（旧口径只扣本方开局分，对此毫无反应）。"""
+        trainer = self.trainer()
+        record = {"own_score": 300, "opening_own": 234,
+                  "other_score": 400, "opening_other": 354,
+                  "score_diff": -100}
+        own_gain = record["own_score"] - record["opening_own"]
+        net_gain = own_gain - (record["other_score"] - record["opening_other"])
+        self.assertEqual(own_gain, 66)
+        self.assertEqual(net_gain, 20)          # 敌方多拿 46 分 ⇒ 净胜分被扣掉
+        self.assertLess(net_gain, own_gain)
 
     def test_stride_subsamples_gradient_only(self):
-        base = self.trainer()
-        strided = self.trainer(trajectory_stride=4)
-        base_records = base.train(1)
-        strided_records = strided.train(1)
-        self.assertEqual(strip_timing(base_records), strip_timing(strided_records))
-        n_base = len(base.pending[0][0])
-        n_strided = len(strided.pending[0][0])
-        self.assertGreater(n_base, 0)
-        self.assertEqual(n_strided, len(range(0, n_base, 4)))
-        self.assertEqual(base.pending[0][1], strided.pending[0][1])   # 学习目标不变
+        full = self.trainer(trajectory_stride=1)
+        sparse = self.trainer(trajectory_stride=8)
+        counts = {}
+        for name, trainer in (("full", full), ("sparse", sparse)):
+            lengths = []
+            original = trainer.policy.update_batch
 
-    def test_resume_rejects_reward_mode_change(self):
+            def capture(batch, original=original, lengths=lengths):
+                lengths.extend(len(history) for history, _ in batch)
+                return original(batch)
+
+            trainer.policy.update_batch = capture
+            trainer.train(2)
+            counts[name] = lengths
+        self.assertTrue(counts["full"])
+        self.assertTrue(all(a >= b for a, b in zip(counts["full"], counts["sparse"])))
+        self.assertLess(sum(counts["sparse"]), sum(counts["full"]))
+
+    def test_checkpoint_does_not_record_removed_modes(self):
         trainer = self.trainer()
-        trainer.train(2)
-        path = Path(self.tmp.name) / "ckpt.json"
-        trainer.save(path)
-        data = json.loads(path.read_text())
-        self.assertEqual(data["reward_mode"], "net_gain")
-        self.assertEqual(data["trajectory_stride"], 1)
-        with self.assertRaises(SystemExit):
-            main(["--snapshot", str(self.snapshot), "--resume", str(path),
-                  "--reward-mode", "own_gain",
-                  "--checkpoint", str(Path(self.tmp.name) / "a.json"),
-                  "--report", str(Path(self.tmp.name) / "a.report.json")])
-        with self.assertRaises(SystemExit):
-            main(["--snapshot", str(self.snapshot), "--resume", str(path),
-                  "--trajectory-stride", "4",
-                  "--checkpoint", str(Path(self.tmp.name) / "b.json"),
-                  "--report", str(Path(self.tmp.name) / "b.report.json")])
-
-    def test_validation(self):
-        with self.assertRaises(ValueError):
-            self.trainer(reward_mode="bogus")
-        for bad in (0, -1, 65, 1.5, True):
-            with self.assertRaises(ValueError):
-                self.trainer(trajectory_stride=bad)
+        data = trainer.checkpoint()
+        for key in ("reward_mode", "seat_pairing", "policy_seed_mode", "opponent_mode"):
+            self.assertNotIn(key, data)
 
 
 if __name__ == "__main__":

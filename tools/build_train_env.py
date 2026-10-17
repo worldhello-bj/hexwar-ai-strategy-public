@@ -8,7 +8,7 @@
   所以 `train/` 里与核心重叠的部分由本脚本从仓库根**同步**，并写
   `train/MANIFEST.json` 记下**逐文件 sha1 + 源版本**。
 * **`--check` 报告漂移**（核心改了、train/ 没同步，或 train/ 里被人手改过）。
-* **手工维护的文件不会被覆盖**：`README.md` / `run_train.py` / `configs/` / `skill/`。
+* **手工维护的文件不会被覆盖**：`README.md` / `run_train.py` / `run_long.py` / `configs/` / `skill/`。
 * 不拷的东西（有意为之）：`offline/site|assets|mock`（官方前端镜像，版权归原厂商）、
   `docs/WARGAMEAI.pdf`（大二进制，仍以 `../docs/WARGAMEAI.pdf` 为准）、
   封存区 `archive/`、采集数据 `snapshot/`（训练时用 `--snapshot ../snapshot/parsed` 指过去）。
@@ -48,8 +48,8 @@ COPY_SPEC = [
 # 数据目录（联接进来，不算生成物/不参与漂移检查）
 DATA_LINKS = ("snapshot",)
 # 手工维护、绝不被脚本覆盖的文件/目录
-AUTHORED = ("README.md", "run_train.py", "configs", "skill", "requirements.txt",
-            "MANIFEST.json", ".gitignore")
+AUTHORED = ("README.md", "run_train.py", "run_long.py", "configs", "skill",
+            "requirements.txt", "MANIFEST.json", ".gitignore")
 # 运行产物目录：**同步时也不能删**（train/ 里唯一会不断累积的训练产物、检查点、评测报告）
 # ★ 历史 bug：`check()` 明确排除它，但同步的清理循环没排除 ⇒ 一跑同步就把
 #   `train/analysis/**` 全删了（包括几十 MB 的检查点）。两处口径必须一致。

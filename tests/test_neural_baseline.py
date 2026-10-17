@@ -115,8 +115,9 @@ class HistoricalBaselineTests(unittest.TestCase):
                 return NeuralTrainer(snapshot, batch_episodes=2, policy_config={
                     "buckets": 8, "hidden_dim": 2, "baseline_offset": "prior_batch_mean"})
             def rollout(t, policy, seed, side, *, training):
-                # Includes completed zero and no-decision games, and truncations.
-                score = None if seed in (2, 5) else seed * 10
+                # 成对训练：种了下标 i//2 ⇒ 0..3 每个种子打蓝/红两局。
+                # 包含已完成但零决策的局（seed 0）、零分局与被截断的局（seed 2）。
+                score = None if seed == 2 else seed * 10
                 decisions = [] if seed == 0 else [policy._decision({"s": seed}, [1, 2])]
                 return {"own_score": score}, decisions
             with patch.object(NeuralTrainer, "_rollout", rollout):
@@ -124,15 +125,17 @@ class HistoricalBaselineTests(unittest.TestCase):
                 whole.train(8)
                 partial = trainer()
                 partial.train(4)
-                self.assertEqual(partial.policy.return_count, 2)
-                self.assertEqual(len(partial.pending), 1)
+                # 种子 0/1 两对已经更新过（每对 2 局）
+                self.assertEqual(partial.policy.return_count, 4)
+                self.assertEqual(len(partial.pending), 0)
                 path = root / "saved.json"
                 partial.save(path)
                 resumed = NeuralTrainer.load(path, snapshot)
                 resumed.train(4)
                 self.assertEqual(resumed.checkpoint(), whole.checkpoint())
+                # 种子 2 被截断（不入批），种子 3 贡献两局
                 self.assertEqual(resumed.policy.return_count, 6)
-                self.assertEqual(resumed.policy.return_mean, 35)
+                self.assertAlmostEqual(resumed.policy.return_mean, 80.0 / 6.0)
                 before = resumed.checkpoint()
                 resumed.train(0)
                 self.assertEqual(before, resumed.checkpoint())

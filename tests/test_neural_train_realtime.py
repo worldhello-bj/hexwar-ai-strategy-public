@@ -26,7 +26,7 @@ class RealtimeTrainingTests(unittest.TestCase):
     def trainer(self, **kwargs):
         return NeuralTrainer(self.snapshot, policy_config={"buckets": 32, "hidden_dim": 4},
                              episode_config={"max_seconds": 6, "max_steps": 100},
-                             interface="realtime", batch_episodes=1, **kwargs)
+                             interface="realtime", batch_episodes=2, **kwargs)
 
     def test_interface_registry_and_config_filter(self):
         """实时接口只吃它认识的键（`max_steps` 这类必须被丢掉）。"""
@@ -43,10 +43,12 @@ class RealtimeTrainingTests(unittest.TestCase):
         self.assertEqual(len(trajectory), record["decisions"])
         self.assertGreaterEqual(record["status"]["seconds"], 1)
         self.assertEqual(record["interface"], "realtime")
-        # 学习目标 = 终局本方分 − 开局本方分
+        # 学习目标 = 净胜分增量（两边各扣开局分后相减）
         self.assertIsNotNone(record["opening_own"])
-        self.assertAlmostEqual(record["learning_return"],
-                               record["own_score"] - record["opening_own"], places=6)
+        self.assertAlmostEqual(
+            record["learning_return"],
+            (record["own_score"] - record["opening_own"])
+            - (record["other_score"] - record["opening_other"]), places=6)
 
     def test_train_and_resume_bind_interface(self):
         """训练一轮后能存能续；把 interface 改成别的会被拒。"""

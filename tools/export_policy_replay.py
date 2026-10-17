@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Export one frozen learned-policy trajectory, never a full policy enumeration.
 
-Uses exactly NeuralTrainer's evaluation/opponent sampling seeds and conventions.
+Uses exactly NeuralTrainer's evaluation and self-play opponent sampling conventions.
 Only learner-seat observations and its legal candidates are exported. Public
 score changes are review markers, not causal explanations or reward shaping.
 """
@@ -11,7 +11,6 @@ import csv
 import hashlib
 import json
 from pathlib import Path
-import random
 import sys
 
 import numpy as np
@@ -35,7 +34,8 @@ def export_replay(checkpoint, snapshot, *, seed, learner_side):
     episode = TwoPlayerEpisode(snapshot, **trainer.episode_config)
     view = PublicObservationAdapter(episode) if trainer.observation_schema == 2 else episode
     status = episode.reset(seed=seed)
-    opponent_rng = random.Random(derived_seed(trainer.seed, seed, learner_side, "opponent"))
+    opponent_rng = np.random.default_rng(
+        derived_seed(trainer.seed, seed, learner_side, "opponent_sample"))
     eval_rng = np.random.default_rng(derived_seed(trainer.seed, seed, learner_side, "evaluation"))
     decisions, review_points = [], []
     initial_observation = view.observe(learner_side)
@@ -68,7 +68,14 @@ def export_replay(checkpoint, snapshot, *, seed, learner_side):
                 "selected_probability": float(probabilities[selected]),
             }))
         else:
-            action = opponent_rng.choice(candidates)
+            # 对手也由策略选招（自博弈），种子与训练器完全一致
+            opponent_candidates = (view.candidate_views(side)
+                                   if trainer.observation_schema == 2
+                                   else episode.legal_actions(side))
+            action = trainer.policy.sample(view.observe(side), opponent_candidates,
+                                           rng=opponent_rng)[0]
+            if trainer.observation_schema == 2:
+                action = action["action"]
         status = episode.step(action, side=side)
         # Observe only the learner seat, even following an opponent action.
         after = view.observe(learner_side)

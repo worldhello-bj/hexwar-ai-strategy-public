@@ -73,8 +73,7 @@ class PolicyReplayTests(unittest.TestCase):
         before = copy.deepcopy(clone.checkpoint())
         source = path.read_bytes()
         with patch('tools.export_policy_replay.NeuralTrainer.load', return_value=clone), \
-             patch.object(clone.policy, 'update_batch', side_effect=AssertionError('must not train')), \
-             patch.object(clone.policy, 'sample', side_effect=AssertionError('must not mutate sampling RNG')):
+             patch.object(clone.policy, 'update_batch', side_effect=AssertionError('must not train')):
             report = export_replay(path, self.snapshot, seed=100, learner_side='BLUE')
         self.assertEqual(before, clone.checkpoint())
         self.assertEqual(source, path.read_bytes())

@@ -105,7 +105,7 @@ class NeuralTrainingTests(unittest.TestCase):
                 trainer.train(2)
                 # The list is cleared after update; capture immutable expectations via wrapper below.
                 self.assertEqual(update.call_count, 1)
-        self.assertEqual(observed, [(0, "BLUE"), (0, "BLUE"), (1, "RED"), (1, "RED")])
+        self.assertEqual(observed, [(0, "BLUE"), (0, "RED"), (0, "BLUE"), (0, "RED")] * 2)
         with patch("env.neural_train.TwoPlayerEpisode", ScriptedEpisode):
             trainer = self.trainer(batch_episodes=2)
             batches = []
@@ -130,12 +130,13 @@ class NeuralTrainingTests(unittest.TestCase):
 
     def test_truncation_never_updates_or_enters_pending(self):
         trainer = NeuralTrainer(self.snapshot, episode_config={"max_seconds": 999, "max_steps": 2},
-                                policy_config={"buckets": 32, "hidden_dim": 4}, batch_episodes=1)
+                                policy_config={"buckets": 32, "hidden_dim": 4}, batch_episodes=2)
         before = copy.deepcopy(trainer.policy.checkpoint())
         records = trainer.train(2)
         self.assertTrue(all(r["status"]["truncated"] for r in records))
         self.assertEqual(trainer.updates, 0)
         self.assertEqual(trainer.pending, [])
+        self.assertEqual(trainer._pair_buffer, {})
         after = trainer.policy.checkpoint()
         for key in ("params", "m", "v", "steps"):
             self.assertEqual(before[key], after[key])
@@ -179,8 +180,9 @@ class NeuralTrainingTests(unittest.TestCase):
         self.assertEqual(before, trainer.checkpoint())
 
     def test_malformed_pending_features_rejected_at_load(self):
-        trainer = self.trainer(batch_episodes=2)
-        trainer.train(1)
+        # 成对后：batch=4、跑 2 局 ⇒ 一对进 pending 但未满批
+        trainer = self.trainer(batch_episodes=4)
+        trainer.train(2)
         data = trainer.checkpoint()
         data["pending"][0]["decisions"][0]["observation"][0][0] = 32
         path = self.root / "invalid.json"
@@ -216,40 +218,37 @@ class PublicNeuralTrainingTests(NeuralTrainingTests):
 
     # These inherited tests intentionally exercise a legacy-only fake or width.
     def test_only_own_observations_and_raw_terminal_targets(self):
-        from env.public_observation import PublicObservationAdapter
         trainer = self.trainer(batch_episodes=2)
         original_sample = trainer.policy.sample
-        original_step = TwoPlayerEpisode.step
-        selected, observations, batches = [], [], []
+        observations, batches = [], []
         original_update = trainer.policy.update_batch
-        def sample(obs, candidates):
-            observations.append(copy.deepcopy(obs))
-            choice, record = original_sample(obs, candidates)
-            selected.append(choice["action"])
-            return choice, record
+        def sample(obs, candidates, rng=None):
+            observations.append((obs["side"], copy.deepcopy(obs)))
+            return original_sample(obs, candidates, rng=rng)
         def step(episode, action, **kwargs):
+            # 送去 step 的只有内层的裸动作，不包含公开上下文包装
             self.assertNotIn("public_context", action)
-            if selected:
-                self.assertIs(action, selected.pop())
             return original_step(episode, action, **kwargs)
         def update(batch):
             batches.extend(score for _, score in batch)
             return original_update(batch)
+        original_step = TwoPlayerEpisode.step
         with patch.object(trainer.policy, "sample", side_effect=sample), \
                 patch.object(trainer.policy, "update_batch", side_effect=update), \
                 patch.object(TwoPlayerEpisode, "step", new=step):
             records = trainer.train(2)
         self.assertEqual(batches, [r["status"]["final_scores"][r["learner_side"]] for r in records])
-        self.assertEqual([o["side"] for o in observations],
-                         [s for s, r in zip(SIDES, records) for _ in range(r["decisions"])])
-        for obs in observations:
+        # 每个决策点只取**行动方自己**的观测（对方那条只给对手选招，不进轨迹）。
+        for side, obs in observations:
+            self.assertEqual(obs["side"], side)
             self.assertEqual(obs["schema_version"], 2)
-            self.assertIn("enemy", obs["score"])
             self.assertIn("board", obs)
+            self.assertIn("enemy", obs["score"])
+        self.assertEqual(sorted({s for s, _ in observations}), ["BLUE", "RED"])
 
     def test_malformed_pending_features_rejected_at_load(self):
-        trainer = self.trainer(batch_episodes=2)
-        trainer.train(1)
+        trainer = self.trainer(batch_episodes=4)
+        trainer.train(2)
         data = trainer.checkpoint()
         data["pending"][0]["decisions"][0]["observation"][0][0] = 64
         path = self.root / "invalid.json"
@@ -260,7 +259,7 @@ class PublicNeuralTrainingTests(NeuralTrainingTests):
     def test_truncation_never_updates_or_enters_pending(self):
         trainer = NeuralTrainer(self.snapshot, observation_schema=2,
                                 episode_config={"max_seconds": 999, "max_steps": 2},
-                                policy_config={"buckets": 32, "hidden_dim": 4}, batch_episodes=1)
+                                policy_config={"buckets": 32, "hidden_dim": 4}, batch_episodes=2)
         before = copy.deepcopy(trainer.policy.checkpoint())
         records = trainer.train(2)
         self.assertEqual(trainer.observation_schema, 2)
