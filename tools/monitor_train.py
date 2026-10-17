@@ -36,23 +36,44 @@ def read_rows(path):
     return rows
 
 
-def summarize(rows, total, window=50, now=None):
-    """把台账整理成一块可直接读的报告（纯函数，便于测试）。"""
+def summarize(rows, total, window=50, now=None, gap_limit=300.0):
+    """把台账整理成一块可直接读的报告（纯函数，便于测试）。
+
+    ★ 速率/ETA 只放**近期窗口**（最后 `window` 行）：长跑中间可能因故停了几个小时
+    （终端被清理、机器休眠），用“从第一行算起”的累计速率会把 ETA 拉到离谱的级别。
+    """
     now = time.time() if now is None else now
     if not rows:
         return {"done": 0, "total": total, "percent": 0.0, "rate_per_min": None,
                 "eta_minutes": None, "updates": 0, "recent": None, "last_wall": None,
-                "stalled_seconds": None}
+                "stalled_seconds": None, "overall_rate_per_min": None}
     done = rows[-1].get("attempted") or len(rows)
     first_wall = rows[0].get("wall")
     last_wall = rows[-1].get("wall")
+    overall = None
+    if (first_wall is not None and last_wall is not None
+            and last_wall > first_wall and done > 1):
+        overall = (done - 1) / ((last_wall - first_wall) / 60.0)
+    # ★ 只看**尾部连续段**：相邻两行相隔超过 `gap_limit` 秒就当成中断
+    #   （终端被清理、机器休眠、手动暂停……）。否则一次 4.7 h 的停机能把 ETA 从
+    #   10 h 拉成 84 h（已踩过）。
+    tail_rows = [rows[-1]]
+    for row in reversed(rows[:-1]):
+        if tail_rows[-1].get("wall", 0) - row.get("wall", 0) > gap_limit:
+            break
+        tail_rows.append(row)
+        if len(tail_rows) >= window:
+            break
+    tail_rows.reverse()
     rate = None
-    if first_wall and last_wall and last_wall > first_wall and done > 1:
-        rate = (done - 1) / ((last_wall - first_wall) / 60.0)
+    if len(tail_rows) >= 2:
+        span = tail_rows[-1].get("wall", 0) - tail_rows[0].get("wall", 0)
+        if span > 0:
+            rate = (len(tail_rows) - 1) / (span / 60.0)
     eta = None
     if rate and total:
         eta = max(0.0, (total - done) / rate)
-    tail = [r for r in rows[-window:] if r.get("R") is not None]
+    tail = [r for r in tail_rows if r.get("R") is not None]
     recent = None
     if tail:
         recent = {
@@ -67,7 +88,8 @@ def summarize(rows, total, window=50, now=None):
         }
     return {"done": done, "total": total,
             "percent": (100.0 * done / total) if total else None,
-            "rate_per_min": rate, "eta_minutes": eta,
+            "rate_per_min": rate, "overall_rate_per_min": overall,
+            "eta_minutes": eta,
             "updates": rows[-1].get("updates"), "recent": recent,
             "last_wall": last_wall,
             "stalled_seconds": (now - last_wall) if last_wall else None}
@@ -78,7 +100,9 @@ def format_line(report):
         return "还没有进度（台账为空）：训练进程可能仍在规则门/第一批 rollout 里"
     parts = ["%d/%d 局 (%.1f%%)" % (report["done"], report["total"], report["percent"] or 0.0)]
     if report["rate_per_min"]:
-        parts.append("%.2f 局/min" % report["rate_per_min"])
+        parts.append("近期 %.2f 局/min" % report["rate_per_min"])
+    if report.get("overall_rate_per_min"):
+        parts.append("累计 %.2f" % report["overall_rate_per_min"])
     if report["eta_minutes"] is not None:
         parts.append("ETA %.1f h" % (report["eta_minutes"] / 60.0))
     parts.append("更新 %s 次" % report["updates"])

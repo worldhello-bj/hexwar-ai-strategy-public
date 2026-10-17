@@ -85,6 +85,22 @@ class ProgressLedgerTests(unittest.TestCase):
         self.assertAlmostEqual(report["recent"]["mean_R"], 15.0)
         self.assertIn("2/4 局", format_line(report))
 
+    def test_rate_uses_recent_window_not_history(self):
+        """长跑中间可能停了几个小时：ETA 只能用**近期**速率，不能被历史缺口拉爆。"""
+        rows = [{"wall": 0.0, "attempted": 1, "completed": 1, "updates": 0,
+                 "own": 300.0, "R": 0.0, "result": "win", "decisions": 20,
+                 "episode_seconds": 5.0}]
+        # 4.7 小时的大空档
+        for i in range(2, 12):
+            rows.append({"wall": 17000.0 + 30.0 * (i - 2), "attempted": i,
+                         "completed": i, "updates": i // 2, "own": 300.0, "R": 1.0,
+                         "result": "win", "decisions": 20, "episode_seconds": 5.0})
+        report = summarize(rows, total=100, window=10, now=17000.0 + 300.0)
+        # 近期 10 行 = 9 个间隔 × 30 s = 270 s ⇒ 2 局/min
+        self.assertAlmostEqual(report["rate_per_min"], 2.0)
+        self.assertLess(report["overall_rate_per_min"], 0.1)
+        self.assertAlmostEqual(report["eta_minutes"], (100 - 11) / 2.0)
+
     def test_empty_ledger_says_so(self):
         report = summarize([], total=10)
         self.assertEqual(report["done"], 0)
